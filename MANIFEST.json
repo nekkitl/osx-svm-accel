@@ -1,0 +1,152 @@
+{
+  "snapshot_date": "2026-10-14",
+  "status": "experimental source publication candidate",
+  "qemu_upstream_commit": "f9587d4045c67cd0d8d8bdcd5d0bb5b6b395b63c",
+  "overlay_manifest": "qemu/manifest.json",
+  "public_run_policy": {
+    "vcpus": [
+      1,
+      2
+    ],
+    "ram_min_bytes": 268435456,
+    "ram_max_bytes": 4294967296,
+    "cpu_hotplug": false,
+    "guest_os_whitelist": false,
+    "selection": "standard QEMU -m / -smp / -drive / -cdrom",
+    "opt_in": "confirm-experimental-run=on,confirm-no-kdp-watchpoints=on"
+  },
+  "hardware_reference": {
+    "result": "PASS_SVM_TWO_CORES_ONLINE_256M",
+    "provider_uuid": "7A07BC16-52EE-33C5-B239-50E6913D73E1",
+    "qemu_uuid": "102A1D09-84AA-3FC6-9449-EA55EABB0298",
+    "qemu_sha256": "2083d95390a6f63fb9e80e46445d8e14ee3c6c4f6a7f192011fdbd54ea8cd3a1",
+    "guest_online": "0-1",
+    "nproc": 2,
+    "sockets": 1,
+    "cores": 2,
+    "ram_bytes": 268435456,
+    "pinned_workload": {
+      "pass": true,
+      "bytes_per_core": 67108864,
+      "expected_sha256": "3b6a07d0d404fab4e23b6d34bc6696a6a312dd92821332385e5af7c01c421351",
+      "affinities": [
+        0,
+        1
+      ]
+    },
+    "stop": {
+      "elapsed_ms": 1.625910999791813,
+      "state": {
+        "status": "paused",
+        "running": false
+      }
+    },
+    "host_state": {
+      "byte_equal": true,
+      "host_cpu_rows": 16
+    },
+    "guest_poweroff": "shutdown confirmed",
+    "qemu_exit": "QMP quit acknowledged",
+    "root_cause": "QEMU provider_halted survived INIT/SIPI after SeaBIOS HLT, blocking first Linux AP entry",
+    "kext_changed": false
+  },
+  "publication_build": {
+    "provider": {
+      "uuid": "7A07BC16-52EE-33C5-B239-50E6913D73E1",
+      "sha256": "82980e357394a349661f0d8e0f693c1466e87f73cbff7746ef1d4935e81713aa",
+      "byte_equal_to_loaded_reference": true,
+      "signature": "unsigned reference-identical build; no kext installed by this preparation",
+      "stock_profile": true,
+      "legacy_run_opt_in": true,
+      "vm_api_run_opt_in": true,
+      "no_run_default_build": "PASS"
+    },
+    "qemu": {
+      "uuid": "F7B8543C-5B56-31BC-A04F-042E1B4C9196",
+      "sha256": "f9351d05fba9ffabe506bd4bfbca2557c78f5a8d5ac1cb8d2c2f4a12e3ca0e20",
+      "clean_upstream_plus_overlay_build": "PASS",
+      "strict_codesign_verify": "PASS",
+      "hardware_guest_run_with_this_binary": false,
+      "reference_frontend_delta": "qemu/public-interface.diff"
+    },
+    "checks": {
+      "provider_offline_targets": 11,
+      "provider_offline": "PASS",
+      "qemu_unit_programs": 6,
+      "qemu_unit_cases": 37,
+      "qemu_units": "PASS",
+      "kpi_imports": 359,
+      "kpi_source_export_audit": "PASS; not a replacement for live kernel binding",
+      "overlay_idempotence": "PASS",
+      "public_frontend_prelaunch": {
+        "pass": true,
+        "checks": [
+          {
+            "test": "reject-three-cpus",
+            "pass": true,
+            "exit_code": 1
+          },
+          {
+            "test": "reject-eight-gib",
+            "pass": true,
+            "exit_code": 1
+          },
+          {
+            "test": "reject-small-ram",
+            "pass": true,
+            "exit_code": 1
+          },
+          {
+            "test": "accept-one-core",
+            "pass": true,
+            "state": {
+              "status": "prelaunch",
+              "running": false
+            },
+            "vcpus": 1,
+            "memory": {
+              "base-memory": 268435456,
+              "plugged-memory": 0
+            },
+            "host_snapshot_equal": true,
+            "guest_execution_requested": false,
+            "vmrun_entry_log_present": false,
+            "exit_code": 0
+          },
+          {
+            "test": "accept-two-cores",
+            "pass": true,
+            "state": {
+              "status": "prelaunch",
+              "running": false
+            },
+            "vcpus": 2,
+            "memory": {
+              "base-memory": 4294967296,
+              "plugged-memory": 0
+            },
+            "host_snapshot_equal": true,
+            "guest_execution_requested": false,
+            "vmrun_entry_log_present": false,
+            "exit_code": 0
+          }
+        ],
+        "qemu_sha256": "f9351d05fba9ffabe506bd4bfbca2557c78f5a8d5ac1cb8d2c2f4a12e3ca0e20"
+      },
+      "qmp_helper_tcg": {
+        "pass": true,
+        "tcg_only": true,
+        "running_quit_rejected": true,
+        "stop_confirmed_paused": true,
+        "exit_code": 0
+      }
+    },
+    "build_environment": {
+      "macos": "26.0.1 (25A362)",
+      "sdk": "26.2",
+      "clang": "Apple clang version 17.0.0 (clang-1700.6.4.2)",
+      "dependency_source_cache": "Verification used the exact pinned upstream Git objects and QEMU wrap package overlays; no dependency sources are distributed."
+    }
+  },
+  "limits": "Short reference hardware tests; no broad guest compatibility or production stability claim."
+}

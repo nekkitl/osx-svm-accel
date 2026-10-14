@@ -1,0 +1,75 @@
+{
+  "date": "2026-10-14",
+  "provider_build": "PASS",
+  "provider_reference_binary_equal": true,
+  "provider_offline": "PASS",
+  "provider_offline_targets": 11,
+  "qemu_clean_build": "PASS",
+  "qemu_unit_programs": 6,
+  "qemu_unit_cases": 37,
+  "kpi_imports": 359,
+  "frontend_checks": {
+    "pass": true,
+    "checks": [
+      {
+        "test": "reject-three-cpus",
+        "pass": true,
+        "exit_code": 1
+      },
+      {
+        "test": "reject-eight-gib",
+        "pass": true,
+        "exit_code": 1
+      },
+      {
+        "test": "reject-small-ram",
+        "pass": true,
+        "exit_code": 1
+      },
+      {
+        "test": "accept-one-core",
+        "pass": true,
+        "state": {
+          "status": "prelaunch",
+          "running": false
+        },
+        "vcpus": 1,
+        "memory": {
+          "base-memory": 268435456,
+          "plugged-memory": 0
+        },
+        "host_snapshot_equal": true,
+        "guest_execution_requested": false,
+        "vmrun_entry_log_present": false,
+        "exit_code": 0
+      },
+      {
+        "test": "accept-two-cores",
+        "pass": true,
+        "state": {
+          "status": "prelaunch",
+          "running": false
+        },
+        "vcpus": 2,
+        "memory": {
+          "base-memory": 4294967296,
+          "plugged-memory": 0
+        },
+        "host_snapshot_equal": true,
+        "guest_execution_requested": false,
+        "vmrun_entry_log_present": false,
+        "exit_code": 0
+      }
+    ],
+    "qemu_sha256": "f9351d05fba9ffabe506bd4bfbca2557c78f5a8d5ac1cb8d2c2f4a12e3ca0e20"
+  },
+  "qmp_helper": {
+    "pass": true,
+    "tcg_only": true,
+    "running_quit_rejected": true,
+    "stop_confirmed_paused": true,
+    "exit_code": 0
+  },
+  "source_only_package": true,
+  "hardware_execution_of_public_frontend": false
+}

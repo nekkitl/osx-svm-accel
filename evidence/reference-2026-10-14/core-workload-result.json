@@ -1,0 +1,9 @@
+{
+  "pass": true,
+  "bytes_per_core": 67108864,
+  "expected_sha256": "3b6a07d0d404fab4e23b6d34bc6696a6a312dd92821332385e5af7c01c421351",
+  "affinities": [
+    0,
+    1
+  ]
+}

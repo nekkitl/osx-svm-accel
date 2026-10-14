@@ -1,0 +1,206 @@
+{
+  "upstream_url": "https://github.com/qemu/qemu.git",
+  "upstream_commit": "f9587d4045c67cd0d8d8bdcd5d0bb5b6b395b63c",
+  "files": [
+    {
+      "path": "accel/Kconfig",
+      "upstream_sha256": "806add60e57e75d282059f1eecee26ed6274cbe38bfc0d79d33c89dda3ae2db0",
+      "sha256": "2f8d78e92c24940a6d3b7404fbc0f835eb1c830b92521e37d4bfc41dbd9feb07"
+    },
+    {
+      "path": "accel/amdsvm/amdsvm-firmware-dispatch.c",
+      "upstream_sha256": null,
+      "sha256": "b5478f91a3ada1ae5be2ee6d2954f44c2a22bb83fcfc0deb920f21bfe8470387"
+    },
+    {
+      "path": "accel/amdsvm/amdsvm-firmware-dispatch.h",
+      "upstream_sha256": null,
+      "sha256": "10c6fc82f378c6f69a19cc51ba4193b509f8a34fb175001fed74156f1053baba"
+    },
+    {
+      "path": "accel/amdsvm/amdsvm-provider-lifecycle.c",
+      "upstream_sha256": null,
+      "sha256": "4d0caf2875af38b8204f9cc423dd3df3a4ff2f32d273af53dcc47061f539dd18"
+    },
+    {
+      "path": "accel/amdsvm/amdsvm-provider-lifecycle.h",
+      "upstream_sha256": null,
+      "sha256": "8d9d533eb947cbf5de0d1d4156b53f839ebdfe6be24817806ab43d81da84662f"
+    },
+    {
+      "path": "accel/amdsvm/amdsvm-vm-provider.c",
+      "upstream_sha256": null,
+      "sha256": "c107ac705a5786fe2ae6a9db3d191cb9316e5dde76434b1aa1e1c8d752f9162b"
+    },
+    {
+      "path": "accel/amdsvm/amdsvm-vm-provider.h",
+      "upstream_sha256": null,
+      "sha256": "1125fd66e7cd377cf089ece8d2e18d00e9f8d07769483b21048987993d90d567"
+    },
+    {
+      "path": "accel/amdsvm/amdsvm.c",
+      "upstream_sha256": null,
+      "sha256": "f43cca668fa953c421edc191c93b2d34500ef2b806c6f386e620db0ea691e60f"
+    },
+    {
+      "path": "accel/amdsvm/meson.build",
+      "upstream_sha256": null,
+      "sha256": "20efb9e7e633c5d5296c7aa17f52b8c182684fcfbaec8949d646fa98a3660609"
+    },
+    {
+      "path": "accel/meson.build",
+      "upstream_sha256": "34e1460fd0a9d2d7d83ef8884a43e13d800c9e87fd1d39a4bd347ab743aedf6c",
+      "sha256": "1dccb05ee7b68ee83ed5e5f2014dc3d832b186d7282e27886b172f0512b86a96"
+    },
+    {
+      "path": "hw/display/vga.c",
+      "upstream_sha256": "3e665fa3672b850212bb13ef782a68c71a5ed2049831cc1ef6e726ad6b17d368",
+      "sha256": "435e18a7e3ec9e39d48a10ba5fb128424f1ef4ccbbee224f9bcd441c324628d4"
+    },
+    {
+      "path": "meson.build",
+      "upstream_sha256": "cd4e02d5c4a58183ac8092deced447f8ce0a5b35f7ea1848689be4c79250f048",
+      "sha256": "c29308929f6562be470c6ad5cb6f6ffef9167a78b89c8d74cf6aea5503f5caa9"
+    },
+    {
+      "path": "meson_options.txt",
+      "upstream_sha256": "c585b6dc0bb1bfc63ba9822e4758dac7a5305655c5ebaf1199f3a55257866d9d",
+      "sha256": "3226da02e2c1b9f3e597f95046ccc8ff946c02e2fd1de4581c4cb83a2f4dadc5"
+    },
+    {
+      "path": "scripts/meson-buildoptions.sh",
+      "upstream_sha256": "964b2c77db60a14ad8f814fc218e579f7f423e1c4e4084e91a301f95130eec2d",
+      "sha256": "7e30cb771f6a4dd0ddd48a9d73b20426e291db42a52a6cd5cb3fb4d575e17245"
+    },
+    {
+      "path": "system/ioport.c",
+      "upstream_sha256": "468b67c55247902df0bf0fd041c58b2fbc8fc90be367f2d0a1fcae6588b45d16",
+      "sha256": "f9da0661adf3500ee52cc737dd11b0fea1597e15c3150c43e0a166c0d7aac997"
+    },
+    {
+      "path": "target/i386/amdsvm/amdsvm-event.h",
+      "upstream_sha256": null,
+      "sha256": "e79d7c45a546c4fa627a28a76f4dab12e70e177dd2700e8970baabdc0477fb82"
+    },
+    {
+      "path": "target/i386/amdsvm/amdsvm-memory-map.c",
+      "upstream_sha256": null,
+      "sha256": "fcbc9e8f27608cb8e80594092c093e2a2ec1c659db0c0adad5d87aabe4f695d8"
+    },
+    {
+      "path": "target/i386/amdsvm/amdsvm-memory-map.h",
+      "upstream_sha256": null,
+      "sha256": "bdf11dc0706f4cd6639a6e6a8cd23f051eb611432656b4488ab43759fe660fe8"
+    },
+    {
+      "path": "target/i386/amdsvm/amdsvm-memory-types.c",
+      "upstream_sha256": null,
+      "sha256": "4f923621cb4a0ff384d2fe5ccc2a705d3647f8af55b325ae84e3ae6c054f8b74"
+    },
+    {
+      "path": "target/i386/amdsvm/amdsvm-memory.c",
+      "upstream_sha256": null,
+      "sha256": "e0366aa6f308ec3be622eefbb05ccf71cc36e78e6b9840fb12447c184bb0ca35"
+    },
+    {
+      "path": "target/i386/amdsvm/amdsvm-memory.h",
+      "upstream_sha256": null,
+      "sha256": "e4e7d0a66ffa8ec41f08f1dd99476ca248d471f43fc2cda8929e8fd9e17dea6c"
+    },
+    {
+      "path": "target/i386/amdsvm/amdsvm-msr.h",
+      "upstream_sha256": null,
+      "sha256": "2f6d3a59a8ec18b47fe49d595b7451aef1df56d4679d4ba3e8d0e5c7853ba990"
+    },
+    {
+      "path": "target/i386/amdsvm/amdsvm-state.c",
+      "upstream_sha256": null,
+      "sha256": "0b602f08a59063ed05139e0f2ca8d9f1e6553a2bed89fe14cd348b46f06c57ad"
+    },
+    {
+      "path": "target/i386/amdsvm/amdsvm-state.h",
+      "upstream_sha256": null,
+      "sha256": "0cf1bb1d8da16711627a8da4b091ccb61b9273dea4735b204cfd6b1e6a198f28"
+    },
+    {
+      "path": "target/i386/amdsvm/meson.build",
+      "upstream_sha256": null,
+      "sha256": "004e23978efc3b988e8ec6a8a13e3de3c1b5dff54cdd1ab62f363ca90d2443c8"
+    },
+    {
+      "path": "target/i386/emulate/meson.build",
+      "upstream_sha256": "7f6dfb1c7cea6b31c79c4610e48db15784baca9aa6d6a541eab35e045e9bcfc7",
+      "sha256": "0c23cca6f2e14e5e9dc1bb51036396f63e545d327c9c832d86683cb19f6d4c5e"
+    },
+    {
+      "path": "target/i386/emulate/x86_emu.c",
+      "upstream_sha256": "cc174af05badbf5c6887f09c2bceb529ed44520a58b6361570ce9f9cf9187b90",
+      "sha256": "fe76c909d6396f5fd492bb619e022b5118b9a40e1785d0a7e1726529b9ab236a"
+    },
+    {
+      "path": "target/i386/hvf/x86.c",
+      "upstream_sha256": "1218015eafa28c820915740cc7fd0032863abfeb53a8e9c4f39896dcff0651ba",
+      "sha256": "e1edfd31f266a59e1e5d4598009b2d34342161f801cdc4b12c2fec5b6cdb09f7"
+    },
+    {
+      "path": "target/i386/hvf/x86_task.c",
+      "upstream_sha256": "04567364404013fb1f1761d1ac88e3e938bad971db0b0c669995f8f07063d590",
+      "sha256": "6f45dab980f74394f0e549a1a655745bc33d8ed3e79022609421d00f903166c9"
+    },
+    {
+      "path": "target/i386/hvf/x86hvf.c",
+      "upstream_sha256": "1852009d7a3e0b82a983f3a5b5b651685d9614664b7793830183fd5fc5d9de76",
+      "sha256": "42dcbad1d5901156f806049203199e3ecf543a2f0ff77860bcba042622463301"
+    },
+    {
+      "path": "target/i386/hvf/x86hvf.h",
+      "upstream_sha256": "f81d4531084b5107f849e24177863f37607c047c92918df70534ce03427f61a7",
+      "sha256": "dbb53d9b66882cfe66dc07266b0992d804aae2bdcfcc85eb2b30738476cfe7b1"
+    },
+    {
+      "path": "target/i386/meson.build",
+      "upstream_sha256": "d29469965cfb75af1e87bd0f623f2f4875278bfe5e85eb5cf1d0a82034e6fc0c",
+      "sha256": "fa5454ba244c76f3c5b1df6e3b05134ca2496c1015afb8d8c1cbeeb60a56ccb3"
+    },
+    {
+      "path": "target/i386/svm.h",
+      "upstream_sha256": "d744cb68e95fde1d0f021a0c17b511b205c37f220f74d7628331400df0f85019",
+      "sha256": "f8939e958429d23ac7dc19ce7faf10c170a8470bd2eb4d40792fa9e00fa5382e"
+    },
+    {
+      "path": "tests/unit/meson.build",
+      "upstream_sha256": "87e31e5524a8d5a9388eecabb0a2e5bc8af5ad0aae8f57ed435b01840a6d4c6c",
+      "sha256": "588813707e45829aba468642c45ae00db595288bc246ac9898a74fb11798c601"
+    },
+    {
+      "path": "tests/unit/test-amdsvm-firmware-dispatch.c",
+      "upstream_sha256": null,
+      "sha256": "19dd658ea888ce5b27d1c2b77842c5a60f5f0b000c4734e20a262e7688df6a05"
+    },
+    {
+      "path": "tests/unit/test-amdsvm-memory-map.c",
+      "upstream_sha256": null,
+      "sha256": "454fa416d2077fd7749c4d7dcdfdcab0e79056027ae4720ba7b0ab397f1e6d6d"
+    },
+    {
+      "path": "tests/unit/test-amdsvm-memory-types.c",
+      "upstream_sha256": null,
+      "sha256": "de0bd9516c2ac74f35484f7a2cb068ebc141866b4a380087831b6dfd4756a10e"
+    },
+    {
+      "path": "tests/unit/test-amdsvm-msr-exit.c",
+      "upstream_sha256": null,
+      "sha256": "6fcd17ddbbb41f6f42cbf8feaf16325ec286a3bdfc5dfe66cfcb244c442cafb2"
+    },
+    {
+      "path": "tests/unit/test-amdsvm-provider-lifecycle.c",
+      "upstream_sha256": null,
+      "sha256": "3ab0703d176a4e334b24da723c470f3a6d5dbb1bc936bae12e527f3b5d1afe32"
+    },
+    {
+      "path": "tests/unit/test-amdsvm-vm-provider.c",
+      "upstream_sha256": null,
+      "sha256": "c66b68f4a1b195aa7a4234d6bd180d11a50e949654287ce2f97b45a3ce975844"
+    }
+  ]
+}

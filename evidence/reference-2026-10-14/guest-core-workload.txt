@@ -1,0 +1,13 @@
+taskset -c 0 sh -c "grep Cpus_allowed_list /proc/self/status; dd 
+if=/dev/zero bs=1M count=64 2>/dev/null | sha256sum" > /tmp/amdvm-core0.txt & ta
+skset -c 1 sh -c "grep Cpus_allowed_list /proc/self/status; dd if=/dev/zero bs=1
+M count=64 2>/dev/null | sha256sum" > /tmp/amdvm-core1.txt & wait; echo CORE0; c
+at /tmp/amdvm-core0.txt; echo CORE1; cat /tmp/amdvm-core1.txt; echo SMP_WORK_DON
+E
+CORE0
+Cpus_allowed_list:	0
+3b6a07d0d404fab4e23b6d34bc6696a6a312dd92821332385e5af7c01c421351  -
+CORE1
+Cpus_allowed_list:	1
+3b6a07d0d404fab4e23b6d34bc6696a6a312dd92821332385e5af7c01c421351  -
+SMP_WORK_DONE

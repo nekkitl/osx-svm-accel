@@ -1,0 +1,28 @@
+echo SMP_AFTER; cat /sys/devices/system/cpu/online; cat /sys/devi
+ces/system/cpu/offline; nproc; grep -E "processor|physical id|core id|cpu cores|
+siblings" /proc/cpuinfo; free -m; dmesg | grep -E "CPU1|smp:|smpboot:"; echo SMP
+_AFTER_DONE
+SMP_AFTER
+0-1
+
+2
+processor	: 0
+physical id	: 0
+siblings	: 2
+core id		: 0
+cpu cores	: 2
+processor	: 1
+physical id	: 0
+siblings	: 2
+core id		: 1
+cpu cores	: 2
+              total        used        free      shared  buff/cache   available
+Mem:            217          31         159           4          27         173
+Swap:           936           0         936
+[    0.147000] smpboot: CPU0: AMD QEMU Virtual CPU version 2.5+ (family: 0xf, model: 0x6b, stepping: 0x1)
+[    0.154000] smp: Bringing up secondary CPUs ...
+[    0.155000] smpboot: x86: Booting SMP configuration:
+[    0.177000] smp: Brought up 1 node, 2 CPUs
+[    0.177000] smpboot: Total of 2 processors activated (12673.02 BogoMIPS)
+SMP_AFTER_DONE
+amd-osx-svm:~# [6n

@@ -1,0 +1,12 @@
+{
+  "pass": true,
+  "cpu_online": "0-1",
+  "nproc": 2,
+  "ram": 268435456,
+  "exit_code": 0,
+  "final_status": {
+    "status": "running",
+    "running": true
+  },
+  "disk_snapshot": true
+}

@@ -1,0 +1,34 @@
+AMDVM_GUEST_CPU_STATE
+0-1
+0-1
+0
+processor	: 0
+siblings	: 1
+cpu cores	: 1
+apicid		: 0
+[    0.000000] Linux version 6.18.55-0-virt (buildozer@build-3-24-x86_64) (cc (Alpine 15.2.0) 15.2.0, GNU ld (GNU Binutils) 2.45.1) #1-Alpine SMP PREEMPT_DYNAMIC 2026-10-05 07:32:06
+[    0.000000] APIC: Static calls initialized
+[    0.000000] found SMP MP-table at [mem 0x000f54b0-0x000f54bf]
+[    0.000000] ACPI: APIC 0x00000000BFFE228F 000080 (v03 BOCHS  BXPC     00000001 BXPC 00000001)
+[    0.000000] ACPI: Reserving APIC table memory at [mem 0xbffe228f-0xbffe230e]
+[    0.000000] ACPI: LAPIC_NMI (acpi_id[0xff] dfl dfl lint[0x1])
+[    0.000000] IOAPIC[0]: apic_id 0, version 32, address 0xfec00000, GSI 0-23
+[    0.000000] ACPI: Using ACPI (MADT) for SMP configuration information
+[    0.000000] APIC: Switch to symmetric I/O mode setup
+[    0.003000] ..TIMER: vector=0x30 apic1=0 pin1=2 apic2=-1 pin2=-1
+[    0.033000] Freeing SMP alternatives memory: 40K
+[    0.155000] APIC calibration not consistent with PM-Timer: 89ms instead of 100ms
+[    0.155000] APIC delta adjusted to PM-Timer: 6250053 (5581875)
+[    0.155000] smpboot: CPU0: AMD QEMU Virtual CPU version 2.5+ (family: 0xf, model: 0x6b, stepping: 0x1)
+[    0.166000] smp: Bringing up secondary CPUs ...
+[    0.168000] smpboot: x86: Booting SMP configuration:
+[   10.172000] CPU1 failed to report alive state
+[   10.172000] smp: Brought up 1 node, 1 CPU
+[   10.172000] smpboot: Total of 1 processors activated (8355.84 BogoMIPS)
+[   10.240000] ACPI: Added _OSI(Processor Device)
+[   10.240000] ACPI: Added _OSI(Processor Aggregator Device)
+[   10.251000] ACPI: Using IOAPIC for interrupt routing
+[   10.572472] Key type asymmetric registered
+[   10.572472] Asymmetric key parser 'x509' registered
+AMDVM_GUEST_CPU_STATE_DONE
+amd-osx-svm:~# 
