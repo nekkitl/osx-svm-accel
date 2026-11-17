@@ -119,3 +119,33 @@ fail:
     memset(request, 0, sizeof(*request));
     return false;
 }
+
+bool amdsvm_build_published_memory_type_request(
+    const AMDVMGuestMemoryMap *current_map,
+    const AMDVMGuestMemoryMap *pinned_map,
+    bool provider_map_is_authoritative,
+    const AMDVMMTRRState *mtrr,
+    AMDVMGuestMTRRPolicy policy,
+    amdvm_vcpu_set_memory_types_request_t *request,
+    Error **errp)
+{
+    const AMDVMGuestMemoryMap *source_map = current_map;
+
+    if (provider_map_is_authoritative) {
+        if (!current_map || !pinned_map ||
+            !amdsvm_memory_map_equal(current_map, pinned_map)) {
+            error_setg(errp,
+                "AMD-SVM current memory map differs from the provider-pinned map");
+            if (request) {
+                memset(request, 0, sizeof(*request));
+            }
+            return false;
+        }
+        /* Semantic equality permits different FlatView chunking. Provider
+         * validation, however, requires every MTRR range to end at an exact
+         * pinned-descriptor boundary, so use the canonical pinned layout. */
+        source_map = pinned_map;
+    }
+    return amdsvm_build_memory_type_request(source_map, mtrr, policy,
+                                            request, errp);
+}

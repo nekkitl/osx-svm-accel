@@ -10,7 +10,7 @@ make checks
 make qemu
 make qemu-checks
 ```
-`provider-experimental` enables both legacy entry and VM-scoped RUN/KICK in `svm-kext/build/experimental/`. Plain `make provider` leaves hardware RUN gated. Neither target installs/loads a kext or executes VMRUN. QEMU is checked out at `f9587d4045c67cd0d8d8bdcd5d0bb5b6b395b63c` into ignored `qemu-src/`, with only the checksummed source overlay applied. Outputs are in `qemu-build/`.
+`provider-experimental` enables both legacy entry and VM-scoped RUN/KICK in `svm-kext/build/experimental/`. It also compiles the optional provider PAUSE and native CR3 capabilities. Both stay off unless requested in QEMU. Plain `make provider` leaves hardware RUN gated. Neither target installs/loads a kext or executes VMRUN. QEMU is checked out at `f9587d4045c67cd0d8d8bdcd5d0bb5b6b395b63c` into ignored `qemu-src/`, with only the checksummed source overlay applied. Outputs are in `qemu-build/`. When upgrading the October snapshot, move its ignored `qemu-src/` and `qemu-build/` directories aside before building. The overlay script checks the current file hashes and refuses to overwrite a previous overlay.
 
 Optional kernel import audit: set `XNU_KPI_EXPORTS` to a matching export list, then run `python3 svm-kext/audit_kpi_imports.py svm-kext/build/experimental/AMDVMProbe.kext/Contents/MacOS/AMDVMProbe "$XNU_KPI_EXPORTS"` as one command. No custom XNU compilation is required by AMDVM. An export-list audit does not prove binding in the running kernel.
 
@@ -52,7 +52,7 @@ These probe commands do not execute VMRUN. Stop if UUID/ABI negotiation does not
 
 ## 3. Choose your guest and resources
 
-Use your own install ISO and QCOW2 disk. This example selects 2 cores and 256 MiB; you can choose 1–2 vCPUs and 256 MiB–4 GiB within the public policy. The provider may reject memory preparation if resources/types are unsuitable. Set `confirm-no-kdp-watchpoints` only when that condition is known to hold.
+Use your own install ISO and QCOW2 disk. This example selects 2 cores and 256 MiB; you can choose 1–8 vCPUs and 256 MiB–16 GiB within the public policy. The provider may reject memory preparation if resources/types are unsuitable. Set `confirm-no-kdp-watchpoints` only when that condition is known to hold.
 
 ```sh
 ./qemu-build/qemu-img create -f qcow2 guest.qcow2 8G
@@ -69,7 +69,7 @@ sudo ./qemu-build/qemu-system-x86_64 \
   -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
   -qmp unix:"$QMP_SOCKET",server=on,wait=off
 ```
-For subsequent disk boots, omit `-cdrom` and `-boot once=d`. Guest images are not restricted to Alpine, but Alpine is the only OS verified so far. The example uses VirtIO devices; other guests may need appropriate drivers or encounter currently unsupported CPU/device behavior. No kernel arguments, boot keystrokes or guest commands are injected by the accelerator.
+For subsequent disk boots, omit `-cdrom` and `-boot once=d`. Start with a disposable image or overlay and consult the [recorded guest profiles](hardware.md). The example assumes VirtIO drivers. Guest boot uses the normal QEMU firmware and device configuration.
 
 ## 4. Observe stop and cleanup
 

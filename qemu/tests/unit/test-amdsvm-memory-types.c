@@ -151,6 +151,75 @@ static void test_provider_split_ranges_remain_exact_in_memory_type_map(void)
                      ==, UINT64_C(5) << 30);
 }
 
+static void test_large_flatview_uses_provider_pinned_boundaries(void)
+{
+    AMDVMGuestMemoryMap flat_map = { 0 };
+    AMDVMGuestMemoryMap pinned_map = { 0 };
+    AMDVMMTRRState mtrr = { 0 };
+    amdvm_vcpu_set_memory_types_request_t request = { 0 };
+    Error *err = NULL;
+    const uint64_t start = UINT64_C(4) << 30;
+    /* 4 GiB low RAM plus this 12 GiB high range models a 16 GiB guest. Each
+     * pinned descriptor is UINT32_MAX rounded down to a page, so the tail
+     * requires a fourth descriptor. */
+    const uint64_t bytes = UINT64_C(12) << 30;
+    const uint64_t first = AMDVM_VCPU_MEMORY_MAX_RANGE_BYTES;
+
+    flat_map.count = 1;
+    flat_map.reset_rom_page_present = true;
+    flat_map.ranges[0] = (AMDVMGuestMemoryRange) {
+        .guest_physical_address = start,
+        .host_virtual_address = UINT64_C(16) << 30,
+        .size = bytes,
+        .flags = AMDSVM_GUEST_RANGE_READ | AMDSVM_GUEST_RANGE_WRITE,
+    };
+    pinned_map = flat_map;
+    pinned_map.count = 0;
+    for (uint64_t offset = 0; offset < bytes; ) {
+        uint64_t size = MIN(bytes - offset, first);
+        pinned_map.ranges[pinned_map.count++] = (AMDVMGuestMemoryRange) {
+            .guest_physical_address = start + offset,
+            .host_virtual_address = (UINT64_C(16) << 30) + offset,
+            .size = size,
+            .flags = AMDSVM_GUEST_RANGE_READ | AMDSVM_GUEST_RANGE_WRITE,
+        };
+        offset += size;
+    }
+    mtrr.phys_bits = 48;
+    mtrr.default_type = AMDVM_MTRR_DEFAULT_ENABLE | AMDVM_MTRR_TYPE_WB;
+
+    g_assert_true(amdsvm_memory_map_equal(&flat_map, &pinned_map));
+    g_assert_cmpuint(pinned_map.count, ==, 4);
+    uint64_t pinned_bytes = 0;
+    for (unsigned i = 0; i < pinned_map.count; ++i) {
+        pinned_bytes += pinned_map.ranges[i].size;
+    }
+    g_assert_cmpuint(pinned_bytes, ==, bytes);
+    g_assert_true(amdsvm_build_published_memory_type_request(
+        &flat_map, &pinned_map, true, &mtrr,
+        AMDVM_GUEST_MTRR_COMPAT_ALL_WB, &request, &err));
+    g_assert_null(err);
+    g_assert_cmpuint(request.range_count, ==, pinned_map.count + 1);
+    g_assert_cmpuint(request.ranges[0].guest_physical_address,
+                     ==, AMDVM_VCPU_RESET_ROM_GPA);
+    for (unsigned i = 0; i < pinned_map.count; ++i) {
+        const amdvm_vcpu_memory_type_range_t *range = &request.ranges[i + 1];
+        g_assert_cmpuint(range->guest_physical_address, ==,
+                         pinned_map.ranges[i].guest_physical_address);
+        g_assert_cmpuint(range->size, ==, pinned_map.ranges[i].size);
+        g_assert_cmpuint(range->memory_type, ==, AMDVM_MTRR_TYPE_WB);
+    }
+
+    /* Without a provider-pinned map, the standalone path retains its input
+     * layout; this protects legacy-provider behavior. */
+    g_assert_true(amdsvm_build_published_memory_type_request(
+        &flat_map, NULL, false, &mtrr,
+        AMDVM_GUEST_MTRR_COMPAT_ALL_WB, &request, &err));
+    g_assert_null(err);
+    g_assert_cmpuint(request.range_count, ==, 2);
+    g_assert_cmpuint(request.ranges[1].size, ==, bytes);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -160,5 +229,7 @@ int main(int argc, char **argv)
                     test_undefined_overlap_fails_closed);
     g_test_add_func("/amdsvm/memory-types/provider-split-ranges",
                     test_provider_split_ranges_remain_exact_in_memory_type_map);
+    g_test_add_func("/amdsvm/memory-types/large-flatview-provider-boundaries",
+                    test_large_flatview_uses_provider_pinned_boundaries);
     return g_test_run();
 }

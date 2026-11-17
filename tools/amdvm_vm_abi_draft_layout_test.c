@@ -38,7 +38,8 @@ main(void)
 	assert(sizeof(amdvm_vm_abi_draft_reset_rom_request_t) == 4120);
 	assert(sizeof(amdvm_vm_abi_draft_vcpu_state_request_t) == 4632);
 	assert(sizeof(amdvm_vm_abi_draft_vcpu_state_result_t) == 4632);
-	assert(sizeof(amdvm_vm_abi_draft_vcpu_run_request_t) == 4648);
+	assert(sizeof(amdvm_vm_abi_draft_vcpu_run_request_t) == 4656);
+	assert(offsetof(amdvm_vm_abi_draft_vcpu_run_request_t, tsc_offset) == 4648);
 	assert(sizeof(amdvm_vm_abi_draft_vcpu_run_result_t) == 4704);
 	assert(sizeof(amdvm_vm_abi_draft_vcpu_kick_request_t) == 32);
 	assert(sizeof(amdvm_vm_abi_draft_vcpu_kick_result_t) == 40);

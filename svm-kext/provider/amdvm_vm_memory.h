@@ -53,6 +53,7 @@ typedef struct amdvm_vm_memory {
 	uint32_t state;
 	uint32_t users;
 	uint64_t generation;
+	volatile uint64_t translation_generation;
 	uint64_t writable_bytes;
 	size_t range_count;
 	size_t page_count;

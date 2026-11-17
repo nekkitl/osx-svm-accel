@@ -17,16 +17,14 @@ static gint amdsvm_memory_region_log_count;
 #define AMDSVM_MEMORY_REGION_LOG_LIMIT 512
 
 /*
- * QEMU can expose immutable firmware at more than one GPA while both ranges
- * point into the same host ROM allocation. Preserve those guest-visible
- * aliases: the provider can map one immutable host page at multiple GPAs.
- * RAM aliases (including any ROM/RAM overlap) remain an error.
+ * QEMU can expose the same backing at multiple GPAs, including writable VGA
+ * RAM aliases. Preserve guest-visible aliases when their permissions match;
+ * the provider validates and accepts those exact same-user-page aliases.
+ * Aliases with different permissions remain an error.
  */
 static bool amdsvm_canonicalize_rom_aliases(AMDVMGuestMemoryMap *map,
                                             Error **errp)
 {
-    const uint32_t rom_flags = AMDSVM_GUEST_RANGE_READ |
-                               AMDSVM_GUEST_RANGE_EXEC;
     AMDVMGuestMemoryMap normalized = { 0 };
 
     normalized.reset_rom_page_present = map->reset_rom_page_present;
@@ -37,45 +35,25 @@ static bool amdsvm_canonicalize_rom_aliases(AMDVMGuestMemoryMap *map,
         const AMDVMGuestMemoryRange *source = &map->ranges[i];
         uint64_t source_end = source->host_virtual_address + source->size;
 
-        if (source->flags != rom_flags) {
-            for (uint32_t j = 0; j < normalized.count; j++) {
-                const AMDVMGuestMemoryRange *prior = &normalized.ranges[j];
-                uint64_t prior_end = prior->host_virtual_address + prior->size;
-                if (source->host_virtual_address < prior_end &&
-                    prior->host_virtual_address < source_end) {
-                    error_setg(errp,
-                        "AMD-SVM rejects overlapping non-ROM host backing ranges: "
-                        "range[%u] GPA=0x%llx HVA=0x%llx size=0x%llx flags=0x%x "
-                        "overlaps range[%u] GPA=0x%llx HVA=0x%llx size=0x%llx flags=0x%x",
-                        i,
-                        (unsigned long long)source->guest_physical_address,
-                        (unsigned long long)source->host_virtual_address,
-                        (unsigned long long)source->size, source->flags,
-                        j,
-                        (unsigned long long)prior->guest_physical_address,
-                        (unsigned long long)prior->host_virtual_address,
-                        (unsigned long long)prior->size, prior->flags);
-                    return false;
-                }
-            }
-            if (!amdsvm_memory_map_append_flatview_range(&normalized,
-                    source->guest_physical_address,
-                    source->host_virtual_address, source->size,
-                    source->flags, NULL, errp)) {
-                return false;
-            }
-            continue;
-        }
-
         for (uint32_t j = 0; j < normalized.count; j++) {
             const AMDVMGuestMemoryRange *prior = &normalized.ranges[j];
             uint64_t prior_end = prior->host_virtual_address + prior->size;
 
             if (source->host_virtual_address < prior_end &&
                 prior->host_virtual_address < source_end &&
-                prior->flags != rom_flags) {
+                prior->flags != source->flags) {
                 error_setg(errp,
-                    "AMD-SVM ROM backing overlaps non-ROM guest memory");
+                    "AMD-SVM host backing aliases have conflicting permissions: "
+                    "range[%u] GPA=0x%llx HVA=0x%llx size=0x%llx flags=0x%x "
+                    "overlaps range[%u] GPA=0x%llx HVA=0x%llx size=0x%llx flags=0x%x",
+                    i,
+                    (unsigned long long)source->guest_physical_address,
+                    (unsigned long long)source->host_virtual_address,
+                    (unsigned long long)source->size, source->flags,
+                    j,
+                    (unsigned long long)prior->guest_physical_address,
+                    (unsigned long long)prior->host_virtual_address,
+                    (unsigned long long)prior->size, prior->flags);
                 return false;
             }
         }
@@ -101,9 +79,13 @@ static bool amdsvm_collect_range(Int128 start, Int128 len,
     uint32_t flags;
     int log_index;
     void *ram_ptr;
+    bool ram;
+    bool romd;
     bool rom;
 
-    if (!memory_region_is_ram(mr)) {
+    ram = memory_region_is_ram(mr);
+    romd = memory_region_is_romd(mr);
+    if (!ram && !romd) {
         return false;
     }
     if (int128_gethi(start) != 0 || int128_gethi(len) != 0 ||
@@ -143,7 +125,11 @@ static bool amdsvm_collect_range(Int128 start, Int128 len,
         return true;
     }
 
-    rom = memory_region_is_rom(mr);
+    /* ROMD pflash has a stable backing pointer for reads, while writes are
+     * still dispatched through QEMU's device model when ROMD is disabled.
+     * Map it as guest read/execute only; never let the provider write into
+     * the host flash backing directly. */
+    rom = memory_region_is_rom(mr) || romd;
     flags = AMDSVM_GUEST_RANGE_READ | AMDSVM_GUEST_RANGE_EXEC;
     if (!rom) {
         flags |= AMDSVM_GUEST_RANGE_WRITE;
@@ -153,7 +139,7 @@ static bool amdsvm_collect_range(Int128 start, Int128 len,
         error_report("AMDVM_MEMORY_REGION name=%s gpa=0x%llx size=0x%llx host=0x%llx ram=%u rom=%u flags=0x%x",
                      memory_region_name(mr), (unsigned long long)gpa,
                      (unsigned long long)size, (unsigned long long)hva,
-                     memory_region_is_ram(mr), rom, flags);
+                     ram, rom, flags);
     } else if (log_index == AMDSVM_MEMORY_REGION_LOG_LIMIT) {
         error_report("AMDVM_MEMORY_REGION further entries suppressed after %u lines",
                      AMDSVM_MEMORY_REGION_LOG_LIMIT);

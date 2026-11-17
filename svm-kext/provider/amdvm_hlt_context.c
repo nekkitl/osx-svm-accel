@@ -5,6 +5,7 @@
 #include "../amdvm_probe_abi.h"
 #include <IOKit/IOLib.h>
 #include <i386/machine_routines.h>
+#include <mach/mach_time.h>
 
 #include <string.h>
 
@@ -21,11 +22,86 @@
 
 #define AMDVM_HLT_NPT_GUEST_PHYS_BITS 32u
 #define AMDVM_HLT_NPT_ASID 1u
+#define AMDVM_HLT_ASID_MAX 32768u
 #define AMDVM_MSR_IA32_PAT UINT32_C(0x277)
 
 extern int cpu_number(void);
 
 static amdvm_quarantine_registry_t gAmdvmQuarantine;
+static amdvm_tlb_asid_allocator_t gAmdvmTlbAsids;
+static volatile uint32_t gAmdvmTlbAsidLock;
+static void amdvm_hlt_cpuid(uint32_t, uint32_t *, uint32_t *, uint32_t *,
+	uint32_t *);
+
+static int
+amdvm_hlt_read_asid_caps(uint32_t *max_asid, int *flush_by_asid)
+{
+	uint32_t a, b, c, d;
+	if (max_asid == NULL || flush_by_asid == NULL) return -1;
+	amdvm_hlt_cpuid(0x80000000u, &a, &b, &c, &d);
+	if (a < 0x8000000au) return -1;
+	amdvm_hlt_cpuid(0x8000000au, &a, &b, &c, &d);
+	*max_asid = b;
+	*flush_by_asid = (d & (1u << 6)) != 0;
+	return b != 0 ? 0 : -1;
+}
+
+static int
+amdvm_hlt_allocate_asid(amdvm_hlt_context_t *context)
+{
+	uint32_t max_asid;
+	int flush_by_asid;
+	if (amdvm_hlt_read_asid_caps(&max_asid, &flush_by_asid) != 0)
+		return -1;
+	if (!flush_by_asid) {
+		/* Legacy hardware gets a full local TLB flush on every entry. */
+		context->tlb_asid = AMDVM_HLT_NPT_ASID;
+		return 0;
+	}
+	if (max_asid > AMDVM_HLT_ASID_MAX) max_asid = AMDVM_HLT_ASID_MAX;
+	while (__sync_lock_test_and_set(&gAmdvmTlbAsidLock, 1u)) {}
+	int rc = amdvm_tlb_asid_allocate(&gAmdvmTlbAsids, max_asid,
+	    &context->tlb_asid);
+	__sync_lock_release(&gAmdvmTlbAsidLock);
+	if (rc == 0) context->tlb_asid_allocated = 1;
+	return rc;
+}
+
+static void
+amdvm_hlt_release_asid(amdvm_hlt_context_t *context)
+{
+	if (context == NULL || !context->tlb_asid_allocated) return;
+	while (__sync_lock_test_and_set(&gAmdvmTlbAsidLock, 1u)) {}
+	amdvm_tlb_asid_release(&gAmdvmTlbAsids, context->tlb_asid);
+	__sync_lock_release(&gAmdvmTlbAsidLock);
+	context->tlb_asid_allocated = 0;
+}
+
+static void
+amdvm_hlt_request_tlb_flush(amdvm_hlt_context_t *context)
+{
+	if (context != NULL) amdvm_tlb_policy_request_flush(&context->tlb_policy);
+}
+
+static int
+amdvm_hlt_prepare_tlb_control(amdvm_hlt_context_t *context, uint64_t *control)
+{
+	uint32_t max_asid;
+	int cpu = cpu_number();
+	int flush_by_asid;
+	if (cpu < 0) return -1;
+	if (!amdvm_asid_caps_cache_lookup(&context->asid_caps_cache,
+	    (uint32_t)cpu, &max_asid, &flush_by_asid)) {
+		if (amdvm_hlt_read_asid_caps(&max_asid, &flush_by_asid) != 0 ||
+		    amdvm_asid_caps_cache_store(&context->asid_caps_cache,
+		    (uint32_t)cpu, max_asid, flush_by_asid) != 0) return -1;
+	}
+	if (context->tlb_asid > max_asid) return -1;
+	/* A context without a private ASID must never use the no-flush path. */
+	if (!context->tlb_asid_allocated) flush_by_asid = 0;
+	return amdvm_tlb_policy_prepare(&context->tlb_policy, context->tlb_asid,
+	    max_asid, cpu, flush_by_asid, control);
+}
 
 amdvm_quarantine_registry_t *
 amdvm_hlt_context_quarantine_registry(void)
@@ -288,8 +364,15 @@ amdvm_hlt_context_init_profile(amdvm_hlt_context_t *context,
 		return AMDVM_HLT_CONTEXT_UNPIN_FAILED;
 	}
 	memset(context, 0, sizeof(*context));
+	amdvm_tlb_policy_init(&context->tlb_policy);
 	context->quarantine_slot = UINT32_MAX;
+	if (amdvm_hlt_allocate_asid(context) != 0) {
+		memset(context, 0, sizeof(*context));
+		return AMDVM_HLT_CONTEXT_ALLOC_FAILED;
+	}
 	if (amdvm_quarantine_reserve(context) != 0) {
+		amdvm_hlt_release_asid(context);
+		memset(context, 0, sizeof(*context));
 		return AMDVM_HLT_CONTEXT_ALLOC_FAILED;
 	}
 	if (amdvm_physmem_alloc_contiguous(&context->backing,
@@ -388,7 +471,7 @@ amdvm_hlt_context_init_profile(amdvm_hlt_context_t *context,
 	if (amdvm_vmcb_configure_probe(context->guest_vmcb,
 	    amdvm_npt_root_pa(&context->npt), amdvm_hlt_page_pa(context,
 	    AMDVM_HLT_IOPM_FIRST_PAGE), amdvm_hlt_page_pa(context,
-	    AMDVM_HLT_MSRPM_FIRST_PAGE), AMDVM_HLT_NPT_ASID) != 0 ||
+	    AMDVM_HLT_MSRPM_FIRST_PAGE), context->tlb_asid) != 0 ||
 	    (qemu_reset_vector ?
 	    amdvm_vmcb_configure_qemu_reset_vector_v1(context->guest_vmcb) :
 	    amdvm_vmcb_configure_realmode_test_v1(context->guest_vmcb)) != 0) {
@@ -400,6 +483,7 @@ amdvm_hlt_context_init_profile(amdvm_hlt_context_t *context,
 	return AMDVM_HLT_CONTEXT_OK;
 
 fail:
+	amdvm_hlt_release_asid(context);
 	amdvm_physmem_free(&context->npt_backing);
 	amdvm_physmem_free(&context->hsave);
 	amdvm_physmem_free(&context->backing);
@@ -528,12 +612,59 @@ int amdvm_hlt_context_attach_vm_memory(amdvm_hlt_context_t *context,
 	context->host_mtrr_valid = 1;
 	amdvm_vmcb_set_u64(context->guest_vmcb, AMDVM_VMCB_NPT_ROOT,
 	    amdvm_npt_root_pa(&context->npt));
-	amdvm_vmcb_set_u64(context->guest_vmcb, AMDVM_VMCB_TLB_CONTROL,
-	    AMDVM_HLT_NPT_ASID | ((uint64_t)AMDVM_SVM_TLB_FLUSH_ALL << 32));
+	amdvm_hlt_request_tlb_flush(context);
 	*npt_pages = pages;
 	rc = AMDVM_HLT_CONTEXT_OK;
 out:
 	amdvm_physmem_free(&backing);
+	if (borrowed) (void)amdvm_vm_memory_release(memory);
+	__sync_lock_release(&context->busy);
+	return rc;
+}
+
+int amdvm_hlt_context_attach_shared_npt(amdvm_hlt_context_t *context,
+    amdvm_vm_memory_t *memory, uint64_t generation,
+    const amdvm_npt_t *npt, size_t npt_pages,
+    const amdvm_host_mtrr_state_t *host_mtrr)
+{
+	size_t i;
+	int borrowed = 0, rc = AMDVM_HLT_CONTEXT_NPT_FAILED;
+	if (!context || !memory || !npt || !host_mtrr || !npt_pages ||
+	    !context->initialized ||
+	    context->guest_payload_gpa != AMDVM_VCPU_RESET_ROM_GPA ||
+	    context->failed || context->guest_memory_mapped || context->shared_memory ||
+	    context->lease.active || npt->pages_used != npt_pages ||
+	    npt->pool == NULL ||
+	    !__sync_bool_compare_and_swap(&context->busy, 0u, 1u))
+		return AMDVM_HLT_CONTEXT_INVALID;
+	if (memory->state != AMDVM_VM_MEMORY_READY ||
+	    memory->range_count == 0 || memory->page_count == 0 ||
+	    memory->range_count > AMDVM_HLT_CONTEXT_MAX_GUEST_RANGES) goto out;
+	if (amdvm_vm_memory_acquire(memory, generation)) goto out;
+	borrowed = 1;
+	/* The VM memory owner owns the pins; this context owns no descriptors. */
+	if (amdvm_quarantine_release(context)) goto out;
+	context->quarantine_slot = UINT32_MAX;
+	context->quarantine_generation = 0;
+	context->npt = *npt;
+	context->npt_shared = 1;
+	context->shared_memory = memory;
+	for (i = 0; i < memory->range_count; ++i) {
+		context->guest_range_gpa[i] = memory->ranges[i].map.guest_physical_address;
+		context->guest_range_size[i] = memory->ranges[i].map.size;
+		context->guest_range_flags[i] = memory->ranges[i].map.flags;
+	}
+	context->guest_range_count = memory->range_count;
+	context->guest_page_count = memory->page_count;
+	context->guest_memory_mapped = 1;
+	context->host_mtrr = *host_mtrr;
+	context->host_mtrr_valid = 1;
+	amdvm_vmcb_set_u64(context->guest_vmcb, AMDVM_VMCB_NPT_ROOT,
+	    amdvm_npt_root_pa(&context->npt));
+	amdvm_hlt_request_tlb_flush(context);
+	borrowed = 0;
+	rc = AMDVM_HLT_CONTEXT_OK;
+out:
 	if (borrowed) (void)amdvm_vm_memory_release(memory);
 	__sync_lock_release(&context->busy);
 	return rc;
@@ -578,6 +709,7 @@ amdvm_hlt_context_map_user_ranges(amdvm_hlt_context_t *context,
 	uint64_t total_mapped_pages = 0;
 	uint64_t total_writable_pages = 0;
 	uint64_t *host_pas = NULL;
+	uint64_t *alias_pas = NULL;
 	size_t npt_page_count = 0;
 	size_t host_pa_count = 0;
 	size_t npt_range_count;
@@ -632,10 +764,7 @@ amdvm_hlt_context_map_user_ranges(amdvm_hlt_context_t *context,
 			uint64_t prior_end = prior_start + ranges[j].size;
 			if (range->user_virtual_address < prior_end &&
 			    prior_start < range->user_virtual_address + range->size &&
-			    (range->flags != (AMDVM_VCPU_MEMORY_READ |
-			    AMDVM_VCPU_MEMORY_EXEC) ||
-			    ranges[j].flags != (AMDVM_VCPU_MEMORY_READ |
-			    AMDVM_VCPU_MEMORY_EXEC))) {
+			    range->flags != ranges[j].flags) {
 				rc = AMDVM_HLT_CONTEXT_INVALID_GUEST;
 				goto fail;
 			}
@@ -718,7 +847,8 @@ amdvm_hlt_context_map_user_ranges(amdvm_hlt_context_t *context,
 	}
 	host_pa_count = (size_t)total_mapped_pages;
 	host_pas = (uint64_t *)IOMalloc(host_pa_count * sizeof(*host_pas));
-	if (host_pas == NULL) {
+	alias_pas = (uint64_t *)IOMalloc(host_pa_count * sizeof(*alias_pas));
+	if (host_pas == NULL || alias_pas == NULL) {
 		rc = AMDVM_HLT_CONTEXT_HOST_PA_ARRAY_ALLOC_FAILED;
 		goto fail;
 	}
@@ -772,9 +902,9 @@ amdvm_hlt_context_map_user_ranges(amdvm_hlt_context_t *context,
 		}
 	}
 	/*
-	 * FlatView aliases are accepted only for immutable RX backing such as BIOS
-	 * ROM aliases. Encode the write bit next to each page number so the pure
-	 * validator can allow immutable duplicate HPAs without losing policy.
+	 * Immutable ROM aliases may share host pages. Writable aliases are allowed
+	 * only when the corresponding ranges name the same user virtual pages with
+	 * identical permissions; encode that provenance for the pure validator.
 	 */
 	{
 		size_t cursor = 0;
@@ -783,17 +913,34 @@ amdvm_hlt_context_map_user_ranges(amdvm_hlt_context_t *context,
 			size_t page_index;
 			for (page_index = 0; page_index < pages; ++page_index) {
 				uint64_t page_number = host_pas[cursor] >> 12;
-				uint64_t rom_aliasable = ranges[i].flags ==
+				uint64_t user_page = ranges[i].user_virtual_address +
+				    page_index * AMDVM_PAGE_SIZE;
+				int backing_aliasable = ranges[i].flags ==
 				    (AMDVM_VCPU_MEMORY_READ | AMDVM_VCPU_MEMORY_EXEC);
-				host_pas[cursor++] = (page_number << 1) | rom_aliasable;
+				if (!backing_aliasable) {
+					for (size_t other = 0; other < range_count; ++other) {
+						if (other != i &&
+						    ranges[other].flags == ranges[i].flags &&
+						    user_page >= ranges[other].user_virtual_address &&
+						    user_page - ranges[other].user_virtual_address <
+						        ranges[other].size) {
+							backing_aliasable = 1;
+							break;
+						}
+					}
+				}
+				alias_pas[cursor++] = (page_number << 1) |
+				    (uint64_t)backing_aliasable;
 			}
 		}
 	}
-	if (amdvm_npt_validate_backing_aliases(host_pas, host_pa_count) !=
+	if (amdvm_npt_validate_backing_aliases(alias_pas, host_pa_count) !=
 	    AMDVM_NPT_OK) {
 		rc = AMDVM_HLT_CONTEXT_INVALID_GUEST;
 		goto fail;
 	}
+	IOFree(alias_pas, host_pa_count * sizeof(*alias_pas));
+	alias_pas = NULL;
 	if (amdvm_physmem_alloc_scatter(&new_npt_backing,
 	    npt_page_count * AMDVM_PAGE_SIZE, (uint8_t)host_phys_bits) != 0 ||
 	    amdvm_physmem_validate(&new_npt_backing) != 0) {
@@ -814,9 +961,9 @@ amdvm_hlt_context_map_user_ranges(amdvm_hlt_context_t *context,
 		goto fail;
 	}
 
+	size_t host_page_offset = 0;
 	for (i = 0; i < range_count; ++i) {
 		uint64_t page_count = ranges[i].size / AMDVM_PAGE_SIZE;
-		uint64_t page_index;
 		uint32_t permissions = AMDVM_NPT_READ;
 		if (ranges[i].flags & AMDVM_VCPU_MEMORY_WRITE) {
 			permissions |= AMDVM_NPT_WRITE;
@@ -824,21 +971,15 @@ amdvm_hlt_context_map_user_ranges(amdvm_hlt_context_t *context,
 		if (ranges[i].flags & AMDVM_VCPU_MEMORY_EXEC) {
 			permissions |= AMDVM_NPT_EXECUTE;
 		}
-		for (page_index = 0; page_index < page_count; ++page_index) {
-			uint64_t host_pa;
-			if (amdvm_physmem_user_page_pa(&pinned[i],
-			    (size_t)page_index, (uint8_t)host_phys_bits,
-			    &host_pa) != 0 ||
-			    amdvm_hlt_pa_is_control_memory(context, host_pa) ||
-			    amdvm_npt_contains_hpa(&new_npt, host_pa) ||
-			    amdvm_npt_map_4k(&new_npt,
-			    ranges[i].guest_physical_address +
-			    page_index * AMDVM_PAGE_SIZE, host_pa, permissions) !=
-			    AMDVM_NPT_OK) {
+		if (page_count > SIZE_MAX - host_page_offset ||
+		    amdvm_npt_map_4k_pages(&new_npt,
+		    ranges[i].guest_physical_address,
+		    host_pas + host_page_offset, (size_t)page_count, permissions) !=
+		    AMDVM_NPT_OK) {
 				rc = AMDVM_HLT_CONTEXT_NPT_FAILED;
 				goto fail;
-			}
 		}
+		host_page_offset += (size_t)page_count;
 	}
 	if (amdvm_npt_map_4k(&new_npt, context->guest_payload_gpa,
 	    context->guest_payload_pa, AMDVM_NPT_READ | AMDVM_NPT_EXECUTE) !=
@@ -857,11 +998,12 @@ amdvm_hlt_context_map_user_ranges(amdvm_hlt_context_t *context,
 			goto fail;
 		}
 	}
-	/* Verify the entire candidate map before changing the VMCB root. */
-	if (new_npt.pages_used != npt_page_count) {
-		rc = AMDVM_HLT_CONTEXT_NPT_FAILED;
-		goto fail;
-	}
+	/*
+	 * A 4-8 GiB guest has one 4 KiB leaf per guest page. Re-walking every
+	 * leaf only repeats deterministic stores from the mapping loop above;
+	 * validate one leaf per page table plus the last page of each range so
+	 * a structural shift still fails before the VMCB root is published.
+	 */
 	for (i = 0; i < range_count; ++i) {
 		uint64_t page_count = ranges[i].size / AMDVM_PAGE_SIZE;
 		uint64_t page_index;
@@ -870,7 +1012,8 @@ amdvm_hlt_context_map_user_ranges(amdvm_hlt_context_t *context,
 			permissions |= AMDVM_NPT_WRITE;
 		if (ranges[i].flags & AMDVM_VCPU_MEMORY_EXEC)
 			permissions |= AMDVM_NPT_EXECUTE;
-		for (page_index = 0; page_index < page_count; ++page_index) {
+		for (page_index = 0; page_index < page_count;
+		     page_index += AMDVM_NPT_ENTRIES) {
 			uint64_t host_pa;
 			if (amdvm_physmem_user_page_pa(&pinned[i],
 			    (size_t)page_index, (uint8_t)host_phys_bits, &host_pa) != 0 ||
@@ -878,6 +1021,19 @@ amdvm_hlt_context_map_user_ranges(amdvm_hlt_context_t *context,
 			    ranges[i].guest_physical_address +
 			    page_index * AMDVM_PAGE_SIZE, host_pa, permissions) !=
 			    AMDVM_NPT_OK) {
+				rc = AMDVM_HLT_CONTEXT_NPT_FAILED;
+				goto fail;
+			}
+		}
+		if (page_count > 1u) {
+			uint64_t host_pa;
+			if (amdvm_physmem_user_page_pa(&pinned[i],
+			    (size_t)(page_count - 1u), (uint8_t)host_phys_bits,
+			    &host_pa) != 0 ||
+			    amdvm_npt_validate_4k_mapping(&new_npt,
+			    ranges[i].guest_physical_address +
+			    (page_count - 1u) * AMDVM_PAGE_SIZE, host_pa,
+			    permissions) != AMDVM_NPT_OK) {
 				rc = AMDVM_HLT_CONTEXT_NPT_FAILED;
 				goto fail;
 			}
@@ -896,9 +1052,7 @@ amdvm_hlt_context_map_user_ranges(amdvm_hlt_context_t *context,
 		context->npt = new_npt;
 		amdvm_vmcb_set_u64(context->guest_vmcb, AMDVM_VMCB_NPT_ROOT,
 		    amdvm_npt_root_pa(&context->npt));
-		amdvm_vmcb_set_u64(context->guest_vmcb, AMDVM_VMCB_TLB_CONTROL,
-		    AMDVM_HLT_NPT_ASID |
-		    ((uint64_t)AMDVM_SVM_TLB_FLUSH_ALL << 32));
+		amdvm_hlt_request_tlb_flush(context);
 		new_npt_backing = old_npt_backing;
 	}
 	IOFree(host_pas, host_pa_count * sizeof(*host_pas));
@@ -913,6 +1067,7 @@ amdvm_hlt_context_map_user_ranges(amdvm_hlt_context_t *context,
 	context->guest_range_count = range_count;
 	context->guest_page_count = total_mapped_pages;
 	context->guest_memory_mapped = 1;
+	amdvm_hlt_request_tlb_flush(context);
 	context->host_mtrr = host_mtrr;
 	context->host_mtrr_valid = 1;
 	IOLog("AMDVM RAM MTRR WB validated ranges=%u guest_pages=%llu npt_pages=%llu\n",
@@ -933,6 +1088,9 @@ fail:
 	}
 	if (host_pas != NULL) {
 		IOFree(host_pas, host_pa_count * sizeof(*host_pas));
+	}
+	if (alias_pas != NULL) {
+		IOFree(alias_pas, host_pa_count * sizeof(*alias_pas));
 	}
 	amdvm_physmem_free(&new_npt_backing);
 	for (i = 0; pinned != NULL && i < range_count; ++i) {
@@ -1117,6 +1275,29 @@ amdvm_hlt_context_set_memory_types(amdvm_hlt_context_t *context,
 		rc = AMDVM_HLT_CONTEXT_MEMORY_TYPE_UNSUPPORTED;
 		goto out;
 	}
+	/*
+	 * The planned PAT index is a per-leaf store. If the requested types
+	 * resolve to the indexes already published, or the first update lands
+	 * on the default index zero, rewriting every leaf of a multi-GiB NPT
+	 * only repeats identical bytes. Commit metadata and skip the walk.
+	 */
+	int pat_unchanged = context->memory_type_count == request->range_count &&
+	    memcmp(pat_indexes, context->memory_pat_indexes,
+	           request->range_count) == 0 &&
+	    context->host_pat_valid != 0 && host_pat == context->host_pat_msr;
+	int pat_default = context->memory_type_count == 0;
+	for (i = 0; pat_default && i < request->range_count; ++i)
+		pat_default = pat_indexes[i] == 0;
+	if (pat_unchanged || pat_default) {
+		memcpy(context->memory_types, requested_types, request->range_count);
+		memcpy(context->memory_pat_indexes, pat_indexes, request->range_count);
+		context->memory_type_count = request->range_count;
+		context->host_pat_msr = host_pat;
+		context->host_pat_valid = 1;
+		*updated_page_count = page_count;
+		rc = AMDVM_HLT_CONTEXT_OK;
+		goto out;
+	}
 	for (i = 0; i < request->range_count; ++i) {
 		npt_pat_ranges[i].guest_gpa =
 		    request->ranges[i].guest_physical_address;
@@ -1126,9 +1307,7 @@ amdvm_hlt_context_set_memory_types(amdvm_hlt_context_t *context,
 	rc = amdvm_npt_update_pat_ranges_atomic(&context->npt, npt_pat_ranges,
 	    request->range_count, old_pat_indexes, page_count, NULL, NULL);
 	if (rc != AMDVM_NPT_OK) {
-		amdvm_vmcb_set_u64(context->guest_vmcb, AMDVM_VMCB_TLB_CONTROL,
-		    AMDVM_HLT_NPT_ASID |
-		    ((uint64_t)AMDVM_SVM_TLB_FLUSH_ALL << 32));
+		amdvm_hlt_request_tlb_flush(context);
 		if (rc == AMDVM_NPT_ROLLBACK_FAILED) {
 			context->failed = 1;
 			rc = AMDVM_HLT_CONTEXT_NPT_ROLLBACK_FAILED;
@@ -1145,9 +1324,9 @@ amdvm_hlt_context_set_memory_types(amdvm_hlt_context_t *context,
 	    (unsigned long long)execution_pat, (unsigned long long)page_count);
 	context->host_pat_msr = host_pat;
 	context->host_pat_valid = 1;
-	amdvm_vmcb_set_u64(context->guest_vmcb, AMDVM_VMCB_TLB_CONTROL,
-	    AMDVM_HLT_NPT_ASID |
-	    ((uint64_t)AMDVM_SVM_TLB_FLUSH_ALL << 32));
+	amdvm_hlt_request_tlb_flush(context);
+	if (context->shared_memory != NULL)
+		__sync_fetch_and_add(&context->shared_memory->translation_generation, 1u);
 	*updated_page_count = page_count;
 	rc = AMDVM_HLT_CONTEXT_OK;
 out:
@@ -1180,12 +1359,11 @@ amdvm_hlt_context_prepare_guest_pat(amdvm_hlt_context_t *context)
 	    &execution) != AMDVM_NPT_OK ||
 	    memcmp(indexes, context->memory_pat_indexes, context->memory_type_count))
 		return -1;
+	amdvm_tlb_policy_observe_pat(&context->tlb_policy, architectural,
+	    execution);
 	context->architectural_guest_pat = architectural;
 	context->execution_pat_active = 1;
 	amdvm_vmcb_set_u64(context->guest_vmcb, AMDVM_VMCB_GUEST_PAT, execution);
-	/* gPAT affects cached translations even when the NPT leaves did not change. */
-	amdvm_vmcb_set_u64(context->guest_vmcb, AMDVM_VMCB_TLB_CONTROL,
-	    AMDVM_HLT_NPT_ASID | ((uint64_t)AMDVM_SVM_TLB_FLUSH_ALL << 32));
 	return 0;
 }
 
@@ -1234,40 +1412,131 @@ amdvm_hlt_context_run(amdvm_hlt_context_t *context,
 	return AMDVM_HLT_CONTEXT_RUN_GATED;
 #else
 	int status;
+	uint64_t tlb_control;
+#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+	uint64_t phaseStartTicks;
+	uint64_t memoryTypeCheckTicks = 0;
+	uint64_t ownerAcquireTicks = 0;
+	uint64_t vmcbPrepareTicks = 0;
+	uint64_t vmrunXstateTicks = 0;
+	uint64_t ownerReleaseTicks = 0;
+	phaseStartTicks = mach_absolute_time();
+#endif
 
-	if (context->guest_memory_mapped != 0 &&
-	    (context->host_pat_valid == 0 ||
-	    amdvm_hlt_read_pat() != context->host_pat_msr)) {
-		/* The leaf PAT selectors are meaningful only under the captured hPAT. */
-		*vmrun_status = AMDVM_VMRUN_INVALID_ARGUMENT;
-		__sync_lock_release(&context->busy);
-		return AMDVM_HLT_CONTEXT_MEMORY_TYPE_UNSUPPORTED;
-	}
 	if (context->guest_memory_mapped != 0) {
 		amdvm_host_mtrr_state_t current_host_mtrr;
+		uint64_t current_pat;
+		uint64_t current_default_type;
+		int current_cpu;
 		if (context->execution_pat_active == 0) {
 			__sync_lock_release(&context->busy);
 			return AMDVM_HLT_CONTEXT_MEMORY_TYPE_UNSUPPORTED;
 		}
-		if (context->host_mtrr_valid == 0 ||
-		    amdvm_hlt_read_host_mtrr_stable(&current_host_mtrr) != 0 ||
-		    !amdvm_host_mtrr_equal(&context->host_mtrr,
-		    &current_host_mtrr)) {
-			/* Never run with an unchecked/different CPU-local MTRR layout. */
+		if (context->host_pat_valid == 0 || context->host_mtrr_valid == 0) {
 			*vmrun_status = AMDVM_VMRUN_INVALID_ARGUMENT;
 			__sync_lock_release(&context->busy);
 			return AMDVM_HLT_CONTEXT_MEMORY_TYPE_UNSUPPORTED;
 		}
+		current_pat = amdvm_hlt_read_pat();
+		current_default_type = amdvm_hlt_read_msr(0x2ffu);
+		current_cpu = cpu_number();
+		if (context->host_mtrr_cache_enabled) {
+			int refresh;
+			if (context->host_mtrr_cache_runs < UINT32_MAX)
+				context->host_mtrr_cache_runs++;
+			refresh = !context->host_mtrr_cache_valid ||
+			    context->host_mtrr_cache_cpu != (uint32_t)current_cpu ||
+			    context->host_mtrr_cache_runs >= 1024u ||
+			    mach_absolute_time() >= context->host_mtrr_cache_deadline ||
+			    current_pat != context->host_mtrr_cache_pat ||
+			    current_default_type != context->host_mtrr_cache_default_type;
+			if (refresh) {
+				int mtrr_status = amdvm_hlt_read_host_mtrr_stable(
+				    &current_host_mtrr);
+				int mtrr_equal = mtrr_status == 0 &&
+				    amdvm_host_mtrr_equal(&context->host_mtrr,
+				    &current_host_mtrr);
+				if (mtrr_status != 0 || !mtrr_equal ||
+				    current_pat != context->host_pat_msr ||
+				    current_default_type != current_host_mtrr.default_type) {
+					IOLog("AMDVM MTRR cache reject cpu=%d cached_cpu=%u def=0x%llx baseline_def=0x%llx pat=0x%llx baseline_pat=0x%llx full_read=%d full_equal=%d\\n",
+					    current_cpu, context->host_mtrr_cache_cpu,
+					    (unsigned long long)current_default_type,
+					    (unsigned long long)context->host_mtrr.default_type,
+					    (unsigned long long)current_pat,
+					    (unsigned long long)context->host_pat_msr,
+					    mtrr_status, mtrr_equal);
+					*vmrun_status = AMDVM_VMRUN_INVALID_ARGUMENT;
+					__sync_lock_release(&context->busy);
+					return AMDVM_HLT_CONTEXT_MEMORY_TYPE_UNSUPPORTED;
+				}
+				context->host_mtrr_cache_cpu = (uint32_t)current_cpu;
+				context->host_mtrr_cache_pat = current_pat;
+				context->host_mtrr_cache_default_type = current_default_type;
+				context->host_mtrr_cache_runs = 0;
+				context->host_mtrr_cache_valid = 1;
+				context->host_mtrr_cache_refresh_needed = 1;
+			}
+		} else if (current_pat != context->host_pat_msr ||
+		    amdvm_hlt_read_host_mtrr_stable(&current_host_mtrr) != 0 ||
+		    !amdvm_host_mtrr_equal(&context->host_mtrr,
+		    &current_host_mtrr)) {
+			/* Legacy mode keeps full per-RUN CPU-local validation. */
+			*vmrun_status = AMDVM_VMRUN_INVALID_ARGUMENT;
+			__sync_lock_release(&context->busy);
+			return AMDVM_HLT_CONTEXT_MEMORY_TYPE_UNSUPPORTED;
+		}
+		if (context->shared_memory != NULL) {
+			uint64_t generation = __sync_val_compare_and_swap(
+			    &context->shared_memory->translation_generation, 0, 0);
+			amdvm_tlb_policy_observe_generation(&context->tlb_policy,
+			    generation);
+		}
 	}
+	#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+	memoryTypeCheckTicks = mach_absolute_time() - phaseStartTicks;
+	phaseStartTicks = mach_absolute_time();
+	#endif
 
 	/* The caller pins this thread to one CPU and disables local interrupts. */
 	status = amdvm_svm_owner_acquire_current_cpu(&context->lease,
 	    &context->hsave);
+#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+	ownerAcquireTicks = mach_absolute_time() - phaseStartTicks;
+	phaseStartTicks = mach_absolute_time();
+#endif
 	*owner_status = status;
 	if (status != AMDVM_SVM_OWNER_OK) {
 		__sync_lock_release(&context->busy);
 		return AMDVM_HLT_CONTEXT_SVM_ACQUIRE_FAILED;
 	}
+	if (amdvm_hlt_prepare_tlb_control(context, &tlb_control) != 0) {
+		status = amdvm_svm_owner_release_current_cpu(&context->lease);
+		*owner_status = status;
+		*vmrun_status = AMDVM_VMRUN_INVALID_ARGUMENT;
+		__sync_lock_release(&context->busy);
+		return status == AMDVM_SVM_OWNER_OK ?
+		    AMDVM_HLT_CONTEXT_INVALID_GUEST :
+		    AMDVM_HLT_CONTEXT_SVM_RELEASE_FAILED;
+	}
+	/* ASID and TLB_CONTROL are adjacent dwords. TLB_CONTROL is not cached;
+	 * avoid rewriting an unchanged ASID so its clean bit remains truthful. */
+	if ((uint32_t)amdvm_vmcb_get_u64(context->guest_vmcb,
+	    AMDVM_VMCB_ASID) != (uint32_t)tlb_control) {
+		amdvm_vmcb_set_u32(context->guest_vmcb, AMDVM_VMCB_ASID,
+		    (uint32_t)tlb_control);
+	}
+	amdvm_vmcb_set_u32(context->guest_vmcb,
+	    AMDVM_VMCB_TLB_CONTROL_COMMAND,
+	    (uint32_t)(tlb_control >> 32));
+	/* Only IOPM/MSRPM and an unchanged ASID are stable between RUNs today.
+	 * All groups touched by guest-state staging remain dirty. */
+	int cacheCpu = cpu_number();
+	uint32_t cleanBits = amdvm_vmcb_clean_policy_prepare(
+	    &context->vmcb_clean_policy, cacheCpu, (uint32_t)tlb_control,
+	    context->guest_vmcb_pa, context->vmcb_clean_candidates);
+	amdvm_vmcb_set_u32(context->guest_vmcb, AMDVM_VMCB_CLEAN_BITS, cleanBits);
+	context->vmcb_clean_candidates = 0;
 
 	/* Reject a stale/unwritten result if VMRUN does not produce a VMEXIT. */
 	amdvm_vmcb_set_u64(context->guest_vmcb, AMDVM_VMCB_EXIT_CODE,
@@ -1279,24 +1548,87 @@ amdvm_hlt_context_run(amdvm_hlt_context_t *context,
 		context->guest_vmcb->bytes[AMDVM_VMCB_DECODE_ASSIST_BYTES +
 		    decodeIndex] = 0xcc;
 	}
+	#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+	vmcbPrepareTicks = mach_absolute_time() - phaseStartTicks;
+	phaseStartTicks = mach_absolute_time();
+	#endif
 	*vmrun_status = amdvm_vmrun_once(&context->backing,
 	    context->host_vmcb,
 	    context->host_vmcb_pa, context->guest_vmcb, context->guest_vmcb_pa,
 	    context->guest_gprs, context->host_xstate, context->guest_xstate,
 	    context->guest_execution_xcr0, exit_snapshot);
+	#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+	vmrunXstateTicks = mach_absolute_time() - phaseStartTicks;
+	phaseStartTicks = mach_absolute_time();
+	if (*vmrun_status == AMDVM_VMRUN_SUCCESS ||
+	    exit_snapshot->code == AMDVM_SVM_EXIT_INVALID)
+		exit_snapshot->vmrun_samples = 1;
+	#endif
+	if (*vmrun_status != AMDVM_VMRUN_SUCCESS) {
+		/* Capture the exact post-VMRUN control block before restoring ASID or
+		 * changing any TLB/CLEAN command fields. */
+		IOLog("AMDVM_VMRUN_FAILURE code=0x%llx status=%d rip=0x%llx nrip=0x%llx info1=0x%llx info2=0x%llx eventinj=0x%llx exit_int_info=0x%llx tlb_control=0x%llx clean=0x%llx interrupt_state=0x%x\n",
+		    (unsigned long long)exit_snapshot->code, *vmrun_status,
+		    (unsigned long long)exit_snapshot->guest_rip,
+		    (unsigned long long)exit_snapshot->next_rip,
+		    (unsigned long long)exit_snapshot->info1,
+		    (unsigned long long)exit_snapshot->info2,
+		    (unsigned long long)exit_snapshot->event_injection,
+		    (unsigned long long)exit_snapshot->exit_int_info,
+		    (unsigned long long)exit_snapshot->tlb_control,
+		    (unsigned long long)exit_snapshot->clean_bits,
+		    exit_snapshot->guest_interruptibility);
+	}
 	status = amdvm_svm_owner_release_current_cpu(&context->lease);
+	#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+	ownerReleaseTicks = mach_absolute_time() - phaseStartTicks;
+	#endif
 	*owner_status = status;
 	if (status != AMDVM_SVM_OWNER_OK) {
 		/* Keep both descriptors alive while the lease may still own HSAVE. */
+		amdvm_hlt_request_tlb_flush(context);
+	#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+		exit_snapshot->memory_type_check_ticks = memoryTypeCheckTicks;
+		exit_snapshot->owner_acquire_ticks = ownerAcquireTicks;
+		exit_snapshot->vmcb_prepare_ticks = vmcbPrepareTicks;
+		exit_snapshot->vmrun_xstate_ticks = vmrunXstateTicks;
+		exit_snapshot->owner_release_ticks = ownerReleaseTicks;
+	#endif
 		__sync_lock_release(&context->busy);
 		return AMDVM_HLT_CONTEXT_SVM_RELEASE_FAILED;
 	}
+	if (*vmrun_status == AMDVM_VMRUN_SUCCESS) {
+		amdvm_vmcb_clean_policy_complete(&context->vmcb_clean_policy,
+		    cacheCpu, (uint32_t)tlb_control, context->guest_vmcb_pa, 1,
+		    exit_snapshot->code);
+		amdvm_tlb_policy_complete(&context->tlb_policy, cpu_number(), 1,
+		    exit_snapshot->code);
+		/* TLB_CONTROL is uncached and can be cleared without touching ASID. */
+		amdvm_vmcb_set_u32(context->guest_vmcb,
+		    AMDVM_VMCB_TLB_CONTROL_COMMAND, 0);
+		if (exit_snapshot->code == AMDVM_SVM_EXIT_WRITE_CR0 ||
+		    exit_snapshot->code == AMDVM_SVM_EXIT_WRITE_CR3 ||
+		    exit_snapshot->code == AMDVM_SVM_EXIT_WRITE_CR4)
+			amdvm_hlt_request_tlb_flush(context);
+	} else {
+		amdvm_vmcb_clean_policy_complete(&context->vmcb_clean_policy,
+		    cacheCpu, (uint32_t)tlb_control, context->guest_vmcb_pa, 0,
+		    exit_snapshot->code);
+		amdvm_hlt_request_tlb_flush(context);
+	}
+#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+	exit_snapshot->memory_type_check_ticks = memoryTypeCheckTicks;
+	exit_snapshot->owner_acquire_ticks = ownerAcquireTicks;
+	exit_snapshot->vmcb_prepare_ticks = vmcbPrepareTicks;
+	exit_snapshot->vmrun_xstate_ticks = vmrunXstateTicks;
+	exit_snapshot->owner_release_ticks = ownerReleaseTicks;
+#endif
 	__sync_lock_release(&context->busy);
 	if (*vmrun_status != AMDVM_VMRUN_SUCCESS) {
 		return AMDVM_HLT_CONTEXT_VMRUN_FAILED;
 	}
 	if (exit_snapshot->code == AMDVM_SVM_EXIT_NOT_RUN ||
-	    exit_snapshot->code == UINT64_MAX) {
+	    exit_snapshot->code == AMDVM_SVM_EXIT_INVALID) {
 		return AMDVM_HLT_CONTEXT_INVALID_GUEST;
 	}
 	return AMDVM_HLT_CONTEXT_OK;
@@ -1351,7 +1683,10 @@ amdvm_hlt_context_destroy(amdvm_hlt_context_t *context)
 				__sync_lock_release(&context->busy);
 				return AMDVM_HLT_CONTEXT_UNPIN_FAILED;
 			}
-			amdvm_physmem_free(&context->npt_backing);
+			amdvm_hlt_release_asid(context);
+			if (!context->npt_shared) {
+				amdvm_physmem_free(&context->npt_backing);
+			}
 			amdvm_physmem_free(&context->hsave);
 			uint32_t quarantine_index = context->quarantine_slot;
 			uint64_t quarantine_generation =
@@ -1367,14 +1702,18 @@ amdvm_hlt_context_destroy(amdvm_hlt_context_t *context)
 		}
 	}
 	if (amdvm_quarantine_release(context) != 0) {
+		amdvm_hlt_release_asid(context);
 		__sync_lock_release(&context->busy);
 		return AMDVM_HLT_CONTEXT_INVALID;
 	}
 	context->guest_range_count = 0;
 	context->guest_page_count = 0;
-	amdvm_physmem_free(&context->npt_backing);
+	if (!context->npt_shared) {
+		amdvm_physmem_free(&context->npt_backing);
+	}
 	amdvm_physmem_free(&context->hsave);
 	amdvm_physmem_free(&context->backing);
+	amdvm_hlt_release_asid(context);
 	if (context->shared_memory) (void)amdvm_vm_memory_release(context->shared_memory);
 	memset(context, 0, sizeof(*context));
 	context->quarantine_slot = UINT32_MAX;

@@ -12,19 +12,54 @@
 typedef struct FirmwareMock {
     unsigned int run_count;
     unsigned int cpuid_count;
+    unsigned int rdtscp_count;
     unsigned int io_count;
     unsigned int string_io_count;
     unsigned int complete_count;
+    unsigned int store_count;
     unsigned int iret_count;
     unsigned int physical_intr_count;
     unsigned int preentry_kick_count;
     uint32_t last_port;
     uint8_t last_output;
+    uint64_t rdtscp_tsc;
+    uint32_t rdtscp_aux;
     bool resumed_with_event;
     bool yield_on_physical_intr;
+    bool fail_store;
     AMDVMEventState events;
     amdvm_x86_guest_state_v1_t stored;
 } FirmwareMock;
+
+static void test_diagnostic_page_fault_reinjection(void)
+{
+    const uint32_t pf_event = AMDVM_VCPU_EVENTINJ_VALID |
+        AMDVM_VCPU_EVENTINJ_TYPE_EXCEPTION |
+        AMDVM_VCPU_EVENTINJ_ERROR_VALID | AMDVM_VCPU_EXCEPTION_PF;
+    AMDVMEventState events = { 0 };
+    amdvm_vcpu_run_request_t request = { 0 };
+    amdvm_x86_guest_state_v1_t guest = { 0 };
+
+    g_assert_true(amdsvm_pf_mapping_mismatch(0, true));
+    g_assert_true(amdsvm_pf_mapping_mismatch(2, true));
+    g_assert_false(amdsvm_pf_mapping_mismatch(0, false));
+    g_assert_false(amdsvm_pf_mapping_mismatch(1, true));
+    g_assert_false(amdsvm_pf_mapping_mismatch(3, true));
+    g_assert_false(amdsvm_event_valid(pf_event, 2));
+    g_assert_false(amdsvm_event_valid(
+        pf_event & ~AMDVM_VCPU_EVENTINJ_ERROR_VALID, 2));
+    g_assert_cmpint(amdsvm_event_queue_exception(&events, pf_event, 2),
+                    !=, 0);
+
+    g_assert_cmpint(amdsvm_event_queue_page_fault(&events, 2), ==, 0);
+    g_assert_cmpint(amdsvm_event_queue_page_fault(&events, 2), !=, 0);
+    amdsvm_event_prepare(&events, &request);
+    g_assert_cmphex(request.event_injection, ==, pf_event);
+    g_assert_cmphex(request.event_injection_error_code, ==, 2);
+    g_assert_cmpint(amdsvm_event_complete(&events, SVM_EXIT_PAUSE, 0,
+                                          &guest), ==, 0);
+    g_assert_false(events.exception_pending);
+}
 
 static int firmware_mock_transport(void *opaque, uint32_t selector,
                                    const void *input, size_t input_size,
@@ -105,6 +140,10 @@ static int dispatch_store(void *opaque,
 {
     FirmwareMock *mock = opaque;
 
+    mock->store_count++;
+    if (mock->fail_store) {
+        return -EIO;
+    }
     mock->stored = *state;
     return 0;
 }
@@ -146,6 +185,16 @@ static int dispatch_cpuid(void *opaque, uint32_t leaf, uint32_t subleaf,
     return 0;
 }
 
+static int dispatch_rdtscp(void *opaque, uint64_t *value, uint32_t *aux)
+{
+    FirmwareMock *mock = opaque;
+
+    mock->rdtscp_count++;
+    *value = mock->rdtscp_tsc;
+    *aux = mock->rdtscp_aux;
+    return 0;
+}
+
 static int dispatch_io(void *opaque, uint32_t port, bool is_input,
                        unsigned size, uint64_t *rax)
 {
@@ -167,12 +216,16 @@ static int dispatch_string_io(
     FirmwareMock *mock = opaque;
 
     mock->string_io_count++;
+    g_assert_cmphex(mock->stored.rip, ==, state->rip);
+    g_assert_cmphex(mock->stored.gpr[AMDSVM_GPR_RSI], ==,
+                    state->gpr[AMDSVM_GPR_RSI]);
     g_assert_cmphex(exit_info1, ==, UINT64_C(0x20ca4));
     g_assert_false((exit_info1 & 1u) != 0);
     g_assert_cmphex(next_rip, ==, state->rip + 2);
     *updated_state = *state;
     updated_state->rip = next_rip;
     updated_state->gpr[AMDSVM_GPR_RSI]++;
+    mock->stored = *updated_state; /* Model CPUX86State mutation in handler. */
     return 0;
 }
 
@@ -326,16 +379,26 @@ static void test_string_io_dispatch(void)
     result.abi_version = AMDVM_VCPU_ABI_VERSION;
     result.flags = AMDVM_VCPU_RUN_CALLED;
     result.state = request.state;
+    result.state.rip = 0x6fb0;
+    result.state.gpr[AMDSVM_GPR_RSI] = 41;
+    mock.stored.rip = 0x1111; /* QEMU's prior state can be stale. */
     result.exit_code = AMDVM_VCPU_EXPECTED_IOIO_EXIT;
     result.exit_info1 = UINT64_C(0x20ca4);
-    result.next_rip = request.state.rip + 2;
+    result.next_rip = result.state.rip + 2;
 
     g_assert_cmpint(amdsvm_dispatch_firmware_exit(&request, &result, &ops,
                   &mock), ==, AMDVM_FIRMWARE_DISPATCH_CONTINUE);
     g_assert_cmpuint(mock.string_io_count, ==, 1);
     g_assert_cmphex(mock.stored.rip, ==, result.next_rip);
-    g_assert_cmpuint(mock.stored.gpr[AMDSVM_GPR_RSI], ==, 1);
+    g_assert_cmpuint(mock.stored.gpr[AMDSVM_GPR_RSI], ==, 42);
+    g_assert_cmpuint(mock.store_count, ==, 1);
     g_assert_cmpuint(mock.complete_count, ==, 1);
+
+    mock.fail_store = true;
+    g_assert_cmpint(amdsvm_dispatch_firmware_exit(&request, &result, &ops,
+                  &mock), ==, AMDVM_FIRMWARE_DISPATCH_ERROR);
+    g_assert_cmpuint(mock.string_io_count, ==, 1);
+    g_assert_cmpuint(mock.store_count, ==, 2);
 }
 
 static void test_pause_dispatch(void)
@@ -366,6 +429,56 @@ static void test_pause_dispatch(void)
                   &mock), ==, AMDVM_FIRMWARE_DISPATCH_ERROR);
 }
 
+static void test_svm_exit_err_is_completed_reset_exit(void)
+{
+    amdvm_vcpu_run_request_t request = { 0 };
+    amdvm_vcpu_run_result_t result = { 0 };
+    const AMDVMFirmwareDispatchOps ops = { 0 };
+    FirmwareMock mock = { 0 };
+
+    request.state.abi_version = AMDVM_X86_STATE_ABI_VERSION;
+    result.abi_version = AMDVM_VCPU_ABI_VERSION;
+    result.flags = AMDVM_VCPU_RUN_CALLED;
+    result.owner_status = 0;
+    result.vmrun_status = 0;
+    result.exit_code = SVM_EXIT_ERR;
+    g_assert_cmpint(amdsvm_dispatch_firmware_exit(&request, &result, &ops,
+                  &mock), ==, AMDVM_FIRMWARE_DISPATCH_RESET);
+    g_assert_cmpuint(mock.complete_count, ==, 0);
+
+    result.exit_code = SVM_EXIT_NOT_RUN;
+    g_assert_cmpint(amdsvm_dispatch_firmware_exit(&request, &result, &ops,
+                  &mock), ==, AMDVM_FIRMWARE_DISPATCH_ERROR);
+}
+
+static void test_emulated_exit_commits_state_once(void)
+{
+    amdvm_vcpu_run_request_t request = { 0 };
+    amdvm_vcpu_run_result_t result = { 0 };
+    FirmwareMock mock = { 0 };
+    const AMDVMFirmwareDispatchOps ops = {
+        .store_state = dispatch_store,
+        .complete_event = dispatch_complete,
+        .emulate_cpuid = dispatch_cpuid,
+    };
+
+    request.state.abi_version = AMDVM_X86_STATE_ABI_VERSION;
+    result.abi_version = AMDVM_VCPU_ABI_VERSION;
+    result.flags = AMDVM_VCPU_RUN_CALLED;
+    result.owner_status = 0;
+    result.vmrun_status = 0;
+    result.exit_code = AMDVM_VCPU_EXPECTED_CPUID_EXIT;
+    result.state = request.state;
+    result.state.rip = 0x1000;
+    result.state.gpr[AMDSVM_GPR_RAX] = 7;
+    result.next_rip = 0x1002;
+    g_assert_cmpint(amdsvm_dispatch_firmware_exit(&request, &result, &ops,
+                  &mock), ==, AMDVM_FIRMWARE_DISPATCH_CONTINUE);
+    g_assert_cmpuint(mock.complete_count, ==, 1);
+    g_assert_cmpuint(mock.store_count, ==, 1);
+    g_assert_cmphex(mock.stored.rip, ==, 0x1002);
+}
+
 static void test_wbinvd_dispatch(void)
 {
     FirmwareMock mock = { 0 };
@@ -392,6 +505,50 @@ static void test_wbinvd_dispatch(void)
     result.exit_info1 = 1;
     g_assert_cmpint(amdsvm_dispatch_firmware_exit(&request, &result, &ops,
                   &mock), ==, AMDVM_FIRMWARE_DISPATCH_ERROR);
+}
+
+static void test_rdtscp_dispatch(void)
+{
+    FirmwareMock mock = {
+        .rdtscp_tsc = UINT64_C(0x12345678abcdef01),
+        .rdtscp_aux = UINT32_C(0x76543210),
+    };
+    amdvm_vcpu_run_request_t request = { 0 };
+    amdvm_vcpu_run_result_t result = { 0 };
+    const AMDVMFirmwareDispatchOps ops = {
+        .store_state = dispatch_store,
+        .complete_event = dispatch_complete,
+        .emulate_rdtscp = dispatch_rdtscp,
+    };
+
+    request.abi_version = AMDVM_VCPU_ABI_VERSION;
+    request.state.rip = 0x123400;
+    request.state.rflags = 2;
+    result.abi_version = AMDVM_VCPU_ABI_VERSION;
+    result.flags = AMDVM_VCPU_RUN_CALLED;
+    result.state = request.state;
+    result.exit_code = SVM_EXIT_RDTSCP;
+    result.next_rip = request.state.rip + 3;
+
+    g_assert_cmpint(amdsvm_dispatch_firmware_exit(&request, &result, &ops,
+                  &mock), ==, AMDVM_FIRMWARE_DISPATCH_CONTINUE);
+    g_assert_cmpuint(mock.rdtscp_count, ==, 1);
+    g_assert_cmphex(mock.stored.rip, ==, request.state.rip + 3);
+    g_assert_cmphex(mock.stored.gpr[AMDSVM_GPR_RAX], ==, 0xabcdef01);
+    g_assert_cmphex(mock.stored.gpr[AMDSVM_GPR_RDX], ==, 0x12345678);
+    g_assert_cmphex(mock.stored.gpr[AMDSVM_GPR_RCX], ==, 0x76543210);
+
+    result.state.cr[4] = UINT64_C(1) << 2;
+    result.state.segments[AMDVM_X86_SEG_CS].selector = 3;
+    g_assert_cmpint(amdsvm_dispatch_firmware_exit(&request, &result, &ops,
+                  &mock), ==, AMDVM_FIRMWARE_DISPATCH_ERROR);
+    g_assert_cmpuint(mock.rdtscp_count, ==, 1);
+
+    result.state.segments[AMDVM_X86_SEG_CS].selector = 0;
+    result.next_rip++;
+    g_assert_cmpint(amdsvm_dispatch_firmware_exit(&request, &result, &ops,
+                  &mock), ==, AMDVM_FIRMWARE_DISPATCH_ERROR);
+    g_assert_cmpuint(mock.rdtscp_count, ==, 1);
 }
 
 static void test_nmi_iret_dispatch(void)
@@ -462,6 +619,60 @@ static void test_xsetbv_values(void)
     g_assert_false(amdsvm_xsetbv_value_valid(0x100000007ull, 0, 0, 7));
 }
 
+static void test_cpuid_xstate_profile(void)
+{
+    uint32_t eax, ebx, ecx, edx;
+
+    eax = ebx = ecx = edx = UINT32_MAX;
+    amdsvm_cpuid_mask_xstate_profile(0x0d, 0, 1,
+                                     &eax, &ebx, &ecx, &edx);
+    g_assert_cmphex(eax, ==, 0x7);
+    g_assert_cmphex(ebx, ==, 0x240);
+    g_assert_cmphex(ecx, ==, 0x340);
+    g_assert_cmphex(edx, ==, 0);
+
+    eax = ebx = ecx = edx = UINT32_MAX;
+    amdsvm_cpuid_mask_xstate_profile(0x0d, 0, 7,
+                                     &eax, &ebx, &ecx, &edx);
+    g_assert_cmphex(ebx, ==, 0x340);
+
+    eax = ebx = ecx = edx = UINT32_MAX;
+    amdsvm_cpuid_mask_xstate_profile(0x0d, 1, 7,
+                                     &eax, &ebx, &ecx, &edx);
+    g_assert_cmphex(eax, ==, 0x7);
+    g_assert_cmphex(ebx | ecx | edx, ==, 0);
+
+    eax = ebx = ecx = edx = UINT32_MAX;
+    amdsvm_cpuid_mask_xstate_profile(0x0d, 2, 7,
+                                     &eax, &ebx, &ecx, &edx);
+    g_assert_cmphex(eax, ==, 0x100);
+    g_assert_cmphex(ebx, ==, 0x240);
+    g_assert_cmphex(ecx | edx, ==, 0);
+
+    eax = ebx = ecx = edx = UINT32_MAX;
+    amdsvm_cpuid_mask_xstate_profile(0x0d, 3, 7,
+                                     &eax, &ebx, &ecx, &edx);
+    g_assert_cmphex(eax | ebx | ecx | edx, ==, 0);
+
+    eax = ebx = ecx = edx = UINT32_MAX;
+    amdsvm_cpuid_mask_xstate_profile(7, 0, 7,
+                                     &eax, &ebx, &ecx, &edx);
+    g_assert_cmphex(ebx & ((1u << 14) | (1u << 16) | (1u << 31)), ==, 0);
+    g_assert_cmphex(ecx & ((1u << 3) | (1u << 4) | (1u << 7)), ==, 0);
+    g_assert_cmphex(edx & ((1u << 20) | (1u << 24)), ==, 0);
+
+    eax = ebx = ecx = edx = UINT32_MAX;
+    amdsvm_cpuid_mask_xstate_profile(7, 1, 7,
+                                     &eax, &ebx, &ecx, &edx);
+    g_assert_cmphex(eax & ((1u << 5) | (1u << 21)), ==, 0);
+    g_assert_cmphex(edx & ((1u << 8) | (1u << 19) | (1u << 21)), ==, 0);
+
+    eax = ebx = ecx = edx = UINT32_MAX;
+    amdsvm_cpuid_mask_xstate_profile(0x1d, 0, 7,
+                                     &eax, &ebx, &ecx, &edx);
+    g_assert_cmphex(eax | ebx | ecx | edx, ==, 0);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -473,10 +684,20 @@ int main(int argc, char **argv)
                     test_string_io_dispatch);
     g_test_add_func("/amdsvm/firmware/pause-dispatch",
                     test_pause_dispatch);
+    g_test_add_func("/amdsvm/firmware/svm-exit-err-reset",
+                    test_svm_exit_err_is_completed_reset_exit);
+    g_test_add_func("/amdsvm/firmware/emulated-exit-store-once",
+                    test_emulated_exit_commits_state_once);
     g_test_add_func("/amdsvm/firmware/wbinvd-dispatch",
                     test_wbinvd_dispatch);
+    g_test_add_func("/amdsvm/firmware/rdtscp-dispatch",
+                    test_rdtscp_dispatch);
     g_test_add_func("/amdsvm/firmware/nmi-iret-dispatch",
                     test_nmi_iret_dispatch);
+    g_test_add_func("/amdsvm/firmware/diagnostic-page-fault-reinjection",
+                    test_diagnostic_page_fault_reinjection);
     g_test_add_func("/amdsvm/firmware/xsetbv-values", test_xsetbv_values);
+    g_test_add_func("/amdsvm/firmware/cpuid-xstate-profile",
+                    test_cpuid_xstate_profile);
     return g_test_run();
 }

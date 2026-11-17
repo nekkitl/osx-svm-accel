@@ -139,16 +139,19 @@ static void test_total_cap_and_overflow_fail_closed(void)
     g_assert_cmpuint(request.range_count, ==, 0);
 }
 
-static void test_only_immutable_rom_backing_may_alias(void)
+static void test_same_permission_backing_aliases_are_allowed(void)
 {
     const uint32_t rom = AMDVM_VCPU_MEMORY_READ | AMDVM_VCPU_MEMORY_EXEC;
     const uint32_t ram = rom | AMDVM_VCPU_MEMORY_WRITE;
 
     g_assert_true(amdsvm_memory_backing_alias_allowed(rom, rom));
+    g_assert_true(amdsvm_memory_backing_alias_allowed(ram, ram));
     g_assert_false(amdsvm_memory_backing_alias_allowed(rom, ram));
-    g_assert_false(amdsvm_memory_backing_alias_allowed(ram, ram));
-    g_assert_false(amdsvm_memory_backing_alias_allowed(
+    g_assert_true(amdsvm_memory_backing_alias_allowed(
         AMDVM_VCPU_MEMORY_READ, AMDVM_VCPU_MEMORY_READ));
+    g_assert_false(amdsvm_memory_backing_alias_allowed(
+        AMDVM_VCPU_MEMORY_READ | (1u << 5),
+        AMDVM_VCPU_MEMORY_READ | (1u << 5)));
 }
 
 static void append_pc_1g_memory_map(AMDVMGuestMemoryMap *map,
@@ -308,6 +311,35 @@ static void test_pc_8g_flatview_fits_ram_and_rom_alias_limits(void)
     g_free(bios);
 }
 
+static void test_map_equality_ignores_padding_bytes(void)
+{
+    const uint32_t flags = AMDSVM_GUEST_RANGE_READ |
+                           AMDSVM_GUEST_RANGE_WRITE;
+    AMDVMGuestMemoryMap a = { 0 };
+    AMDVMGuestMemoryMap b;
+    Error *err = NULL;
+
+    g_assert_true(amdsvm_memory_map_append_flatview_range(
+        &a, 0x1000, 0x200000, 0x1000, flags, NULL, &err));
+    g_assert_null(err);
+    b = a;
+
+    for (size_t i = offsetof(AMDVMGuestMemoryRange, flags) +
+                    sizeof(a.ranges[0].flags);
+         i < sizeof(AMDVMGuestMemoryRange); i++) {
+        ((uint8_t *)&b.ranges[0])[i] ^= 0xff;
+    }
+    for (size_t i = offsetof(AMDVMGuestMemoryMap, count) + sizeof(a.count);
+         i < offsetof(AMDVMGuestMemoryMap, total_ram); i++) {
+        ((uint8_t *)&b)[i] ^= 0xff;
+    }
+    g_assert_true(amdsvm_memory_map_equal(&a, &b));
+
+    b.ranges[0].host_virtual_address += 0x1000;
+    g_assert_false(amdsvm_memory_map_equal(&a, &b));
+    error_free(err);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -323,11 +355,13 @@ int main(int argc, char **argv)
                     test_capacity_failure_is_atomic);
     g_test_add_func("/amdsvm/memory-map/cap-and-overflow",
                     test_total_cap_and_overflow_fail_closed);
-    g_test_add_func("/amdsvm/memory-map/immutable-rom-alias",
-                    test_only_immutable_rom_backing_may_alias);
+    g_test_add_func("/amdsvm/memory-map/same-permission-alias",
+                    test_same_permission_backing_aliases_are_allowed);
     g_test_add_func("/amdsvm/memory-map/pc-1g-flatview-reset-rom",
                     test_pc_1g_flatview_splits_reset_rom_and_coalesces_by_hva);
     g_test_add_func("/amdsvm/memory-map/pc-8g-flatview-alias-cap",
                     test_pc_8g_flatview_fits_ram_and_rom_alias_limits);
+    g_test_add_func("/amdsvm/memory-map/equality-ignores-padding",
+                    test_map_equality_ignores_padding_bytes);
     return g_test_run();
 }

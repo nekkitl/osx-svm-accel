@@ -15,6 +15,7 @@
 #include "target/i386/cpu-qom.h"
 #include "target/i386/amdsvm/amdsvm-state.h"
 #include "target/i386/emulate/x86_mmu.h"
+#include "target/i386/emulate/x86_decode.h"
 #include "../../../svm-kext/provider/amdvm_vmcb.h"
 #include "../../../svm-kext/provider/amdvm_vmrun.h"
 #include "../../../svm-kext/provider/amdvm_xstate.h"
@@ -43,6 +44,7 @@ amdvm_vmrun_status_t amdvm_vmrun_validate_guest_xstate(const void *area,
 
 static uint8_t guest_code[16];
 static X86CPU *test_cpu;
+static unsigned cr3_update_calls;
 
 /* These paths are outside the offline decoder/state-mapping tests. */
 AddressSpace address_space_io;
@@ -78,12 +80,41 @@ void cpu_x86_update_cr0(CPUX86State *env, uint32_t value)
 
 void cpu_x86_update_cr3(CPUX86State *env, target_ulong value)
 {
+    cr3_update_calls++;
     env->cr[3] = value;
 }
 
 void cpu_x86_update_cr4(CPUX86State *env, uint32_t value)
 {
     env->cr[4] = value;
+}
+
+uint8_t cpu_get_apic_tpr(APICCommonState *apic)
+{
+    (void)apic;
+    return 0;
+}
+
+void cpu_set_apic_tpr(APICCommonState *apic, uint8_t value)
+{
+    (void)apic;
+    (void)value;
+}
+
+uint64_t cpu_get_tsc(CPUX86State *env)
+{
+    (void)env;
+    return 0;
+}
+
+void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
+                   uint32_t *eax, uint32_t *ebx,
+                   uint32_t *ecx, uint32_t *edx)
+{
+    (void)env;
+    (void)index;
+    (void)count;
+    *eax = *ebx = *ecx = *edx = 0;
 }
 
 static void register_test_cpu(void)
@@ -253,22 +284,23 @@ static void test_direction_and_nrip_fail_closed(void)
     g_assert_cmpuint(test_cpu->env.eip, ==, 0);
 }
 
-static void test_unknown_msr_injects_gp_without_advancing_rip(void)
+static void test_unknown_msr_reads_zero_like_tcg(void)
 {
     uint32_t event = 0;
     uint32_t error_code = UINT32_MAX;
     Error *err = NULL;
 
     reset_instruction(0x0f, 0x32, UINT32_C(0xdeadbeef), 0);
+    test_cpu->env.regs[R_EAX] = UINT32_MAX;
+    test_cpu->env.regs[R_EDX] = UINT32_MAX;
     g_assert_true(amdsvm_handle_msr_exit(CPU(test_cpu), 0, 2,
                                          &event, &error_code, &err));
     g_assert_null(err);
-    g_assert_cmpuint(event, ==, AMDVM_VCPU_EVENTINJ_VALID |
-                     AMDVM_VCPU_EVENTINJ_TYPE_EXCEPTION |
-                     AMDVM_VCPU_EVENTINJ_ERROR_VALID |
-                     AMDVM_VCPU_EXCEPTION_GP);
+    g_assert_cmpuint(event, ==, 0);
     g_assert_cmpuint(error_code, ==, 0);
-    g_assert_cmpuint(test_cpu->env.eip, ==, 0);
+    g_assert_cmpuint(test_cpu->env.regs[R_EAX], ==, 0);
+    g_assert_cmpuint(test_cpu->env.regs[R_EDX], ==, 0);
+    g_assert_cmpuint(test_cpu->env.eip, ==, 2);
 }
 
 static void reset_cr_instruction(const uint8_t *bytes, size_t len)
@@ -464,6 +496,76 @@ static void test_qemu_guest_state_xstate_roundtrip(void)
     g_assert_cmpuint(env->xmm_regs[0].ZMM_Q(3), ==, expected_ymm0_high);
 }
 
+static void test_state_store_cr3_uses_qemu_update(void)
+{
+    CPUX86State *env = &test_cpu->env;
+    amdvm_x86_guest_state_v1_t state;
+    unsigned before;
+
+    memset(env, 0, sizeof(*env));
+    env->eflags = 2;
+    env->cr[0] = CR0_ET_MASK | CR0_PE_MASK | CR0_PG_MASK;
+    env->cr[3] = 0x1000;
+    env->cr[4] = CR4_PAE_MASK;
+    env->efer = MSR_EFER_LME | MSR_EFER_LMA;
+    env->xcr0 = XSTATE_FP_MASK;
+    env->xstate_bv = 0;
+    env->mxcsr = 0x1f80;
+    env->dr[6] = DR6_FIXED_1;
+    env->dr[7] = DR7_FIXED_1;
+    env->pat = UINT64_C(0x0007040600070406);
+
+    g_assert_cmpint(amdsvm_state_load(CPU(test_cpu), &state), ==, 0);
+    state.cr[3] = 0x2000;
+    before = cr3_update_calls;
+    g_assert_cmpint(amdsvm_state_store(CPU(test_cpu), &state), ==, 0);
+    g_assert_cmpuint(env->cr[3], ==, 0x2000);
+    g_assert_cmpuint(cr3_update_calls, ==, before + 1);
+
+    /* An unchanged CR3 must not trigger a redundant TLB update. */
+    before = cr3_update_calls;
+    g_assert_cmpint(amdsvm_state_store(CPU(test_cpu), &state), ==, 0);
+    g_assert_cmpuint(cr3_update_calls, ==, before);
+
+    /* NOFLUSH without PCIDE is invalid and fails before mutating CR3. */
+    state.cr[3] = UINT64_C(1) << 63;
+    g_assert_cmpint(amdsvm_state_store(CPU(test_cpu), &state), ==, -EINVAL);
+    g_assert_cmpuint(env->cr[3], ==, 0x2000);
+    g_assert_cmpuint(cr3_update_calls, ==, before);
+}
+
+static void test_state_cr2_roundtrip(void)
+{
+    CPUX86State *env = &test_cpu->env;
+    amdvm_x86_guest_state_v1_t state;
+    unsigned before;
+
+    memset(env, 0, sizeof(*env));
+    env->eflags = 2;
+    env->cr[0] = CR0_ET_MASK | CR0_PE_MASK | CR0_PG_MASK;
+    env->cr[2] = UINT64_C(0x1111222233334444);
+    env->cr[3] = 0x1000;
+    env->cr[4] = CR4_PAE_MASK;
+    env->efer = MSR_EFER_LME | MSR_EFER_LMA;
+    env->xcr0 = XSTATE_FP_MASK;
+    env->xstate_bv = 0;
+    env->mxcsr = 0x1f80;
+    env->dr[6] = DR6_FIXED_1;
+    env->dr[7] = DR7_FIXED_1;
+    env->pat = UINT64_C(0x0007040600070406);
+
+    g_assert_cmpint(amdsvm_state_load(CPU(test_cpu), &state), ==, 0);
+    g_assert_cmphex(state.cr[2], ==, UINT64_C(0x1111222233334444));
+    state.cr[2] = UINT64_C(0xaaaabbbbccccdddd);
+    before = cr3_update_calls;
+    g_assert_cmpint(amdsvm_state_store(CPU(test_cpu), &state), ==, 0);
+    g_assert_cmphex(env->cr[2], ==, UINT64_C(0xaaaabbbbccccdddd));
+    g_assert_cmpuint(env->cr[3], ==, 0x1000);
+    g_assert_cmpuint(cr3_update_calls, ==, before);
+    g_assert_cmpint(amdsvm_state_load(CPU(test_cpu), &state), ==, 0);
+    g_assert_cmphex(state.cr[2], ==, UINT64_C(0xaaaabbbbccccdddd));
+}
+
 static void test_qemu_reset_vector_state_maps_to_provider(void)
 {
     CPUX86State *env = &test_cpu->env;
@@ -563,6 +665,121 @@ static void test_segment_attribute_bit_mapping(void)
     g_assert_cmphex(state.segments[AMDVM_X86_SEG_SS].attributes, ==, 0x0c93);
 }
 
+static void test_mmio_rmw_decoder_profile(void)
+{
+    static const uint8_t rtl8139_and_word[] = {
+        0x66, 0x81, 0xa1, 0xe0, 0x00, 0x00, 0x00, 0xfc, 0xff,
+    };
+    static const uint8_t locked_and_word[] = {
+        0xf0, 0x66, 0x81, 0xa1, 0xe0, 0x00, 0x00, 0x00, 0xfc, 0xff,
+    };
+    static const uint8_t cmp_word[] = {
+        0x66, 0x81, 0xb9, 0xe0, 0x00, 0x00, 0x00, 0xfc, 0xff,
+    };
+    x86_insn_stream stream;
+    struct x86_decode decode;
+    CPUX86State *env = &test_cpu->env;
+
+    env->hflags |= HF_CS64_MASK | HF_LMA_MASK;
+    env->cr[0] |= CR0_PE_MASK | CR0_PG_MASK;
+    env->efer |= MSR_EFER_LME | MSR_EFER_LMA;
+    stream = (x86_insn_stream) {
+        .bytes = rtl8139_and_word,
+        .len = sizeof(rtl8139_and_word),
+    };
+    memset(&decode, 0, sizeof(decode));
+    g_assert_cmpuint(decode_instruction_stream(env, &decode, &stream), >, 0);
+    g_assert_cmpint(decode.cmd, ==, X86_DECODE_CMD_AND);
+    g_assert_cmpint(decode.op[0].type, ==, X86_VAR_RM);
+    g_assert_true(amdsvm_state_npf_mmio_rmw_supported(&decode));
+
+    stream.bytes = locked_and_word;
+    stream.len = sizeof(locked_and_word);
+    memset(&decode, 0, sizeof(decode));
+    g_assert_cmpuint(decode_instruction_stream(env, &decode, &stream), >, 0);
+    g_assert_true(decode.lock);
+    g_assert_false(amdsvm_state_npf_mmio_rmw_supported(&decode));
+
+    stream.bytes = cmp_word;
+    stream.len = sizeof(cmp_word);
+    memset(&decode, 0, sizeof(decode));
+    g_assert_cmpuint(decode_instruction_stream(env, &decode, &stream), >, 0);
+    g_assert_cmpint(decode.cmd, ==, X86_DECODE_CMD_CMP);
+    g_assert_false(amdsvm_state_npf_mmio_rmw_supported(&decode));
+}
+
+static void test_mmio_read_decoder_profile(void)
+{
+    static const uint8_t rtl8139_test_byte[] = { 0x44, 0x84, 0x40, 0x5a };
+    static const uint8_t rtl8139_cmp_byte[] = {
+        0x80, 0xb8, 0x8b, 0x00, 0x00, 0x00, 0x00,
+    };
+    static const uint8_t rtl8139_bt_word[] = {
+        0x66, 0x0f, 0xba, 0x60, 0x62, 0x0c,
+    };
+    static const uint8_t locked_test_byte[] = { 0xf0, 0x44, 0x84, 0x40, 0x5a };
+    x86_insn_stream stream;
+    struct x86_decode decode;
+    CPUX86State *env = &test_cpu->env;
+
+    env->hflags |= HF_CS64_MASK | HF_LMA_MASK;
+    env->cr[0] |= CR0_PE_MASK | CR0_PG_MASK;
+    env->efer |= MSR_EFER_LME | MSR_EFER_LMA;
+    stream = (x86_insn_stream) {
+        .bytes = rtl8139_test_byte,
+        .len = sizeof(rtl8139_test_byte),
+    };
+    memset(&decode, 0, sizeof(decode));
+    g_assert_cmpuint(decode_instruction_stream(env, &decode, &stream), >, 0);
+    g_assert_cmpint(decode.cmd, ==, X86_DECODE_CMD_TST);
+    g_assert_true(amdsvm_state_npf_mmio_read_supported(&decode));
+
+    stream.bytes = rtl8139_cmp_byte;
+    stream.len = sizeof(rtl8139_cmp_byte);
+    memset(&decode, 0, sizeof(decode));
+    g_assert_cmpuint(decode_instruction_stream(env, &decode, &stream), >, 0);
+    g_assert_cmpint(decode.cmd, ==, X86_DECODE_CMD_CMP);
+    g_assert_true(amdsvm_state_npf_mmio_read_supported(&decode));
+
+    stream.bytes = rtl8139_bt_word;
+    stream.len = sizeof(rtl8139_bt_word);
+    memset(&decode, 0, sizeof(decode));
+    g_assert_cmpuint(decode_instruction_stream(env, &decode, &stream), >, 0);
+    g_assert_cmpint(decode.cmd, ==, X86_DECODE_CMD_BT);
+    g_assert_true(amdsvm_state_npf_mmio_read_supported(&decode));
+
+    stream.bytes = locked_test_byte;
+    stream.len = sizeof(locked_test_byte);
+    memset(&decode, 0, sizeof(decode));
+    g_assert_cmpuint(decode_instruction_stream(env, &decode, &stream), >, 0);
+    g_assert_true(decode.lock);
+    g_assert_false(amdsvm_state_npf_mmio_read_supported(&decode));
+}
+
+static void test_cpuid_publishes_known_tsc_frequency(void)
+{
+    CPUX86State *env = &test_cpu->env;
+    uint32_t eax, ebx, ecx, edx;
+
+    test_cpu->vmware_cpuid_freq = true;
+    env->tsc_khz = 3400001;
+    env->apic_bus_freq = 400000000;
+
+    amdsvm_emulate_cpuid(CPU(test_cpu), 0x40000000, 0,
+                         &eax, &ebx, &ecx, &edx);
+    g_assert_cmphex(eax, ==, 0x40000010);
+    g_assert_cmphex(ebx, ==, 0);
+    g_assert_cmphex(ecx, ==, 0);
+    g_assert_cmphex(edx, ==, 0);
+
+    amdsvm_emulate_cpuid(CPU(test_cpu), 0x40000010, 0,
+                         &eax, &ebx, &ecx, &edx);
+    g_assert_cmpuint(eax, ==, 3400001);
+    g_assert_cmpuint(ebx, ==, 400000);
+    g_assert_cmphex(ecx, ==, 0);
+    g_assert_cmphex(edx, ==, 0);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -571,8 +788,8 @@ int main(int argc, char **argv)
     g_test_add_func("/amdsvm/msr/rdmsr-state", test_rdmsr_uses_qemu_state);
     g_test_add_func("/amdsvm/msr/wrmsr-state", test_wrmsr_mutates_qemu_state);
     g_test_add_func("/amdsvm/msr/direction-and-nrip", test_direction_and_nrip_fail_closed);
-    g_test_add_func("/amdsvm/msr/unknown-injects-gp",
-                    test_unknown_msr_injects_gp_without_advancing_rip);
+    g_test_add_func("/amdsvm/msr/unknown-reads-zero-like-tcg",
+                    test_unknown_msr_reads_zero_like_tcg);
     g_test_add_func("/amdsvm/cr/mov-from-cr0",
                     test_mov_from_cr0_uses_guest_state);
     g_test_add_func("/amdsvm/cr/mov-to-cr3-r8",
@@ -585,9 +802,19 @@ int main(int argc, char **argv)
                     test_cr4_pcide_requires_paging);
     g_test_add_func("/amdsvm/state/legacy-xstate-roundtrip",
                     test_qemu_guest_state_xstate_roundtrip);
+    g_test_add_func("/amdsvm/state/cr3-update-path",
+                    test_state_store_cr3_uses_qemu_update);
+    g_test_add_func("/amdsvm/state/cr2-roundtrip",
+                    test_state_cr2_roundtrip);
     g_test_add_func("/amdsvm/state/qemu-reset-vector",
                     test_qemu_reset_vector_state_maps_to_provider);
     g_test_add_func("/amdsvm/state/segment-attribute-bit-mapping",
                     test_segment_attribute_bit_mapping);
+    g_test_add_func("/amdsvm/npf/mmio-rmw-decoder-profile",
+                    test_mmio_rmw_decoder_profile);
+    g_test_add_func("/amdsvm/npf/mmio-read-decoder-profile",
+                    test_mmio_read_decoder_profile);
+    g_test_add_func("/amdsvm/cpuid/known-tsc-frequency",
+                    test_cpuid_publishes_known_tsc_frequency);
     return g_test_run();
 }

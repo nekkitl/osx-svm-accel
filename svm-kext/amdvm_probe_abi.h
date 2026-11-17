@@ -77,7 +77,19 @@
 #define AMDVM_VCPU_EXIT_PHYSICAL_INTR 0x60ull
 
 /* Stable architectural state order for the forthcoming QEMU vCPU ABI. */
-#define AMDVM_X86_STATE_ABI_VERSION 2u
+#define AMDVM_X86_STATE_ABI_VERSION_V2 2u
+#define AMDVM_X86_STATE_ABI_VERSION_V3 3u
+/* v2 is the fallback understood by the live E6 provider. */
+#define AMDVM_X86_STATE_ABI_VERSION AMDVM_X86_STATE_ABI_VERSION_V2
+#define AMDVM_X86_STATE_ABI_VERSION_CURRENT AMDVM_X86_STATE_ABI_VERSION_V3
+#define AMDVM_X86_STATE_CR8_VALID(value) ((value) <= 0x0full)
+
+static inline int
+amdvm_x86_state_abi_supported(uint32_t version)
+{
+	return version == AMDVM_X86_STATE_ABI_VERSION_V2 ||
+	    version == AMDVM_X86_STATE_ABI_VERSION_V3;
+}
 #define AMDVM_X86_INTERRUPTIBILITY_STI_SHADOW (1u << 0)
 #define AMDVM_X86_INTERRUPTIBILITY_NMI_BLOCKED (1u << 1)
 /* Temporarily single-step a native IRET to observe architectural NMI unblock. */
@@ -122,7 +134,11 @@ typedef struct amdvm_x86_guest_state_v1 {
 	uint64_t rip;
 	uint64_t rflags;
 	amdvm_x86_segment_state_t segments[AMDVM_X86_SEGMENT_COUNT];
-	uint64_t cr[5]; /* CR0, reserved CR1, CR2, CR3, CR4 */
+	/*
+	 * CR0, CR2, CR3, CR4. In state ABI v3, cr[1] carries the guest
+	 * CR8/V_TPR value (0..15); v2 requires cr[1] == 0.
+	 */
+	uint64_t cr[5];
 	uint64_t efer;
 	uint64_t dr[8];
 	uint64_t pat;

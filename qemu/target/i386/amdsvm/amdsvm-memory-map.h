@@ -27,7 +27,11 @@ typedef struct AMDVMGuestMemoryMap {
     uint8_t reset_rom_page[AMDVM_VCPU_RESET_ROM_SIZE];
 } AMDVMGuestMemoryMap;
 
-/* Only immutable ROM backing may be mapped at multiple guest physical ranges. */
+/* Compare map meaning, excluding C struct padding bytes. */
+bool amdsvm_memory_map_equal(const AMDVMGuestMemoryMap *a,
+                            const AMDVMGuestMemoryMap *b);
+
+/* Same host pages may back multiple GPAs when the permissions also match. */
 bool amdsvm_memory_backing_alias_allowed(uint32_t first_flags,
                                         uint32_t second_flags);
 

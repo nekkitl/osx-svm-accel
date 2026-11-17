@@ -16,6 +16,9 @@ int amdvm_vm_cpu_state_init(amdvm_vm_cpu_state_t *, const amdvm_vmcb_t *,
     const uint64_t gprs[15], const void *xstate);
 int amdvm_vm_cpu_state_set(amdvm_vm_cpu_state_t *, amdvm_vmcb_t *,
     uint64_t gprs[15], void *xstate, const amdvm_x86_guest_state_v1_t *);
+/* Caller has already validated the full input state. */
+int amdvm_vm_cpu_state_set_validated(amdvm_vm_cpu_state_t *, amdvm_vmcb_t *,
+    uint64_t gprs[15], void *xstate, const amdvm_x86_guest_state_v1_t *);
 int amdvm_vm_cpu_state_get(const amdvm_vm_cpu_state_t *, const amdvm_vmcb_t *,
     const uint64_t gprs[15], const void *xstate, amdvm_x86_guest_state_v1_t *);
 #ifdef __cplusplus

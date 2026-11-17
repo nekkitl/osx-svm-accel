@@ -19,6 +19,9 @@ main(void)
 	assert(amdvm_kick_generation_should_dispatch(11, 11));
 	assert(!amdvm_kick_generation_should_dispatch(10, 11));
 	assert(amdvm_kick_generation_should_dispatch(1, UINT64_MAX));
+	assert(amdvm_kick_generation_should_update(12, 11, 0));
+	assert(!amdvm_kick_generation_should_update(11, 11, 0));
+	assert(!amdvm_kick_generation_should_update(12, 11, 1));
 
 	puts("amdvm kick generation retry logic: PASS");
 	return 0;

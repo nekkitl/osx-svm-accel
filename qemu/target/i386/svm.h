@@ -89,6 +89,7 @@
 #define SVM_EXIT_WRITE_DR6      0x036
 #define SVM_EXIT_WRITE_DR7      0x037
 #define SVM_EXIT_EXCP_BASE      0x040
+#define SVM_EXIT_EXCP_PF        (SVM_EXIT_EXCP_BASE + 14)
 #define SVM_EXIT_INTR           0x060
 #define SVM_EXIT_NMI            0x061
 #define SVM_EXIT_SMI            0x062
@@ -138,6 +139,8 @@
 #define SVM_EXIT_NPF            0x400
 
 #define SVM_EXIT_ERR            -1
+#define SVM_EXIT_NOT_RUN        (UINT64_MAX - 1u)
+#define SVM_EXIT_INVALID        UINT64_C(0xffffffff)
 
 #define SVM_CR0_SELECTIVE_MASK (1 << 3 | 1) /* TS and MP */
 

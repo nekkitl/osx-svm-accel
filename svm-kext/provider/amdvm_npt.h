@@ -124,7 +124,7 @@ int amdvm_npt_update_pat_ranges_atomic(amdvm_npt_t *npt,
 	const amdvm_npt_pat_range_t *ranges, size_t range_count,
 	uint8_t *old_pat_indexes, size_t page_count,
 	amdvm_npt_pat_set_callback_t set_callback, void *callback_context);
-/* Validate sorted keys encoded as ((host_pa >> 12) << 1) | rom_aliasable. */
+/* Validate sorted keys encoded as ((host_pa >> 12) << 1) | backing_aliasable. */
 int amdvm_npt_validate_backing_aliases(uint64_t *encoded_pages,
 	size_t page_count);
 uint64_t amdvm_npt_root_pa(const amdvm_npt_t *npt);

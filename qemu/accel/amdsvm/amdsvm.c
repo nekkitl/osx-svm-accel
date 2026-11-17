@@ -20,10 +20,14 @@
 #include "system/address-spaces.h"
 #include "hw/core/boards.h"
 #include "system/cpus.h"
+#include "exec/icount.h"
 #include "system/ioport.h"
 #include "system/memory.h"
 #include "system/runstate.h"
 #include "qemu/guest-random.h"
+#include "qemu/main-loop.h"
+#include "qemu/timer.h"
+#include "qemu/processor.h"
 #include "chardev/char.h"
 #include "chardev/char-fe.h"
 #include <IOKit/IOKitLib.h>
@@ -33,17 +37,22 @@
 
 #include "../../../svm-kext/amdvm_probe_abi.h"
 #include "amdsvm-firmware-dispatch.h"
+#include "amdsvm-bql-policy.h"
 #include "amdsvm-provider-lifecycle.h"
 #include "amdsvm-vm-provider.h"
 #include "../../target/i386/amdsvm/amdsvm-memory.h"
 #include "../../target/i386/amdsvm/amdsvm-state.h"
+#include "amdsvm-native-cr3-policy.h"
 #include "../../target/i386/svm.h"
 
 #define AMDSVM_CONTEXT_VMRUN_FAILED (-11)
 #define AMDSVM_VMRUN_FPU_NOT_READY (-6)
 #define AMDSVM_PREENTRY_FPU_RETRY_LIMIT 3u
-#define AMDSVM_VMEXIT_TRACE_INITIAL_LIMIT 4096u
+#define AMDSVM_VMEXIT_TRACE_INITIAL_LIMIT 64u
 #define AMDSVM_VMEXIT_TRACE_SAMPLE_MASK 0xfffu
+#define AMDSVM_KERNEL_EVENT_TRACE_LIMIT 4096u
+#define AMDSVM_KERNEL_EXCEPTION_TRACE_LIMIT 256u
+#define AMDSVM_KERNEL_GPR_TRACE_LIMIT 512u
 
 bool amdsvm_allowed = true;
 static unsigned amdsvm_firmware_pci_io_diag_count;
@@ -67,49 +76,267 @@ typedef struct AMDVMFaultMemorySection {
     bool is_rom;
 } AMDVMFaultMemorySection;
 
-static bool amdsvm_find_fault_memory_section(Int128 start, Int128 len,
-                                             const MemoryRegion *mr,
-                                             hwaddr offset_in_region,
-                                             void *opaque)
+static void amdsvm_format_bytes(char *out, size_t out_size,
+                                const uint8_t *bytes, size_t length)
 {
-    AMDVMFaultMemorySection *section = opaque;
-    uint64_t gpa, size, ram_offset;
-    void *ram_ptr;
+    size_t used = 0;
 
-    if (int128_gethi(start) != 0 || int128_gethi(len) != 0 ||
-        int128_getlo(len) == 0) {
-        return false;
+    if (out_size == 0) {
+        return;
     }
-    gpa = int128_get64(start);
-    size = int128_get64(len);
-    if (section->gpa < gpa || section->gpa - gpa >= size) {
-        return false;
+    out[0] = '\0';
+    for (size_t i = 0; i < length && used < out_size; i++) {
+        int written = g_snprintf(out + used, out_size - used,
+                                 i == 0 ? "%02x" : ":%02x", bytes[i]);
+        if (written < 0 || (size_t)written >= out_size - used) {
+            out[out_size - 1] = '\0';
+            return;
+        }
+        used += written;
     }
-    section->found = true;
-    section->range_gpa = gpa;
-    section->size = size;
-    section->name = memory_region_name(mr);
-    section->is_ram = memory_region_is_ram(mr);
-    section->is_rom = memory_region_is_rom(mr);
-    if (!section->is_ram || offset_in_region > UINT64_MAX -
-            (section->gpa - gpa)) {
-        return true;
+}
+
+typedef struct AMDVMGuestPageWalk {
+    uint64_t entries[4];
+    uint64_t gpa;
+    int failed_level;
+} AMDVMGuestPageWalk;
+
+/* Diagnostic-only guest page-table walk. This uses the CR3 returned by the
+ * provider, not CPUX86State's possibly stale software copy. */
+static int amdsvm_debug_guest_walk_4level(uint64_t cr3, uint64_t cr4,
+                                          uint64_t linear,
+                                          AMDVMGuestPageWalk *walk)
+{
+    static const unsigned shifts[4] = { 39, 30, 21, 12 };
+    uint64_t table = cr3 & UINT64_C(0x000ffffffffff000);
+
+    memset(walk, 0, sizeof(*walk));
+    walk->failed_level = -1;
+    if ((cr4 & (UINT64_C(1) << 12)) != 0) {
+        walk->failed_level = -2; /* LA57 needs a five-level walk. */
+        return -1;
     }
-    ram_offset = offset_in_region + (section->gpa - gpa);
-    ram_ptr = memory_region_get_ram_ptr((MemoryRegion *)mr);
-    if (ram_ptr && (uintptr_t)ram_ptr <= UINT64_MAX - ram_offset) {
-        section->hva = (uint64_t)(uintptr_t)ram_ptr + ram_offset;
+    for (unsigned level = 0; level < 4; level++) {
+        uint64_t raw = 0;
+        uint64_t entry_gpa = table + ((linear >> shifts[level]) & 0x1ffu) * 8;
+        MemTxResult status = address_space_read(&address_space_memory,
+            entry_gpa, MEMTXATTRS_UNSPECIFIED, &raw, sizeof(raw));
+        if (status != MEMTX_OK) {
+            walk->failed_level = level;
+            return -1;
+        }
+        walk->entries[level] = le64_to_cpu(raw);
+        uint64_t entry = walk->entries[level];
+        if ((entry & 1u) == 0) {
+            walk->failed_level = level;
+            return -1;
+        }
+        if (level == 1 && (entry & (UINT64_C(1) << 7))) {
+            walk->gpa = (entry & UINT64_C(0x000fffffc0000000)) |
+                        (linear & ((UINT64_C(1) << 30) - 1));
+            return 0;
+        }
+        if (level == 2 && (entry & (UINT64_C(1) << 7))) {
+            walk->gpa = (entry & UINT64_C(0x000fffffffe00000)) |
+                        (linear & ((UINT64_C(1) << 21) - 1));
+            return 0;
+        }
+        table = entry & UINT64_C(0x000ffffffffff000);
+        if (level == 3) {
+            walk->gpa = table | (linear & 0xfffu);
+            return 0;
+        }
     }
-    return true;
+    walk->failed_level = 4;
+    return -1;
+}
+
+static int amdsvm_debug_guest_virtual_read(uint64_t cr3, uint64_t cr4,
+                                            uint64_t linear, void *buffer,
+                                            size_t length,
+                                            AMDVMGuestPageWalk *first_walk)
+{
+    uint8_t *bytes = buffer;
+    bool first = true;
+
+    while (length != 0) {
+        AMDVMGuestPageWalk walk;
+        size_t chunk;
+        if (amdsvm_debug_guest_walk_4level(cr3, cr4, linear, &walk) != 0) {
+            if (first_walk && first) {
+                *first_walk = walk;
+            }
+            return -1;
+        }
+        if (first_walk && first) {
+            *first_walk = walk;
+        }
+        first = false;
+        chunk = MIN(length, (size_t)(0x1000 - (walk.gpa & 0xfffu)));
+        if (address_space_read(&address_space_memory, walk.gpa,
+                MEMTXATTRS_UNSPECIFIED, bytes, chunk) != MEMTX_OK) {
+            return -2;
+        }
+        bytes += chunk;
+        linear += chunk;
+        length -= chunk;
+    }
+    return 0;
+}
+
+static void amdsvm_log_guest_virtual_read(const char *name, uint64_t linear,
+                                           int status,
+                                           const AMDVMGuestPageWalk *walk,
+                                           const uint8_t *bytes,
+                                           size_t length)
+{
+    char hex[160];
+    amdsvm_format_bytes(hex, sizeof(hex), bytes, length);
+    error_report("AMDVM_TRIPLE_FAULT_GUEST_VA name=%s linear=0x%llx status=%d level=%d gpa=0x%llx pml4e=0x%llx pdpte=0x%llx pde=0x%llx pte=0x%llx bytes=%s",
+        name, (unsigned long long)linear, status,
+        walk ? walk->failed_level : -3,
+        (unsigned long long)(walk ? walk->gpa : 0),
+        (unsigned long long)(walk ? walk->entries[0] : 0),
+        (unsigned long long)(walk ? walk->entries[1] : 0),
+        (unsigned long long)(walk ? walk->entries[2] : 0),
+        (unsigned long long)(walk ? walk->entries[3] : 0), hex);
+}
+
+static bool amdsvm_is_transition16big_state(
+    const amdvm_x86_guest_state_v1_t *state)
+{
+    return state->segments[AMDVM_X86_SEG_CS].selector == 0x50;
+}
+
+static void amdsvm_trace_transition_state(
+    const char *stage, int vcpu,
+    const amdvm_x86_guest_state_v1_t *state,
+    uint64_t exit_code, uint32_t exit_int_info, uint64_t eventinj)
+{
+    const amdvm_x86_segment_state_t *cs =
+        &state->segments[AMDVM_X86_SEG_CS];
+    const amdvm_x86_segment_state_t *ss =
+        &state->segments[AMDVM_X86_SEG_SS];
+    const amdvm_x86_segment_state_t *ds =
+        &state->segments[AMDVM_X86_SEG_DS];
+    const amdvm_x86_segment_state_t *es =
+        &state->segments[AMDVM_X86_SEG_ES];
+    const amdvm_x86_segment_state_t *fs =
+        &state->segments[AMDVM_X86_SEG_FS];
+    const amdvm_x86_segment_state_t *gs =
+        &state->segments[AMDVM_X86_SEG_GS];
+    const amdvm_x86_segment_state_t *gdtr =
+        &state->segments[AMDVM_X86_SEG_GDTR];
+    const amdvm_x86_segment_state_t *idtr =
+        &state->segments[AMDVM_X86_SEG_IDTR];
+    char eventinj_text[32];
+
+    if (eventinj == UINT64_MAX) {
+        g_strlcpy(eventinj_text, "unavailable", sizeof(eventinj_text));
+    } else {
+        g_snprintf(eventinj_text, sizeof(eventinj_text), "0x%llx",
+                   (unsigned long long)eventinj);
+    }
+
+    error_report("AMDVM_TRANSITION_STATE stage=%s vcpu=%d exit=0x%llx exit_int_info=0x%x eventinj=%s rip=0x%llx rsp=0x%llx rflags=0x%llx cr0=0x%llx pe=%u interruptibility=0x%x cs=%04x/%04x:%08x:0x%016llx ss=%04x/%04x:%08x:0x%016llx ds=%04x/%04x:%08x:0x%016llx es=%04x/%04x:%08x:0x%016llx fs=%04x/%04x:%08x:0x%016llx gs=%04x/%04x:%08x:0x%016llx gdtr=%04x/%04x:%08x:0x%016llx idtr=%04x/%04x:%08x:0x%016llx",
+                 stage, vcpu, (unsigned long long)exit_code, exit_int_info,
+                 eventinj_text,
+                 (unsigned long long)state->rip,
+                 (unsigned long long)state->gpr[AMDSVM_GPR_RSP],
+                 (unsigned long long)state->rflags,
+                 (unsigned long long)state->cr[0],
+                 (unsigned)(state->cr[0] & 1u), state->interruptibility,
+                 cs->selector, cs->attributes, cs->limit,
+                 (unsigned long long)cs->base,
+                 ss->selector, ss->attributes, ss->limit,
+                 (unsigned long long)ss->base,
+                 ds->selector, ds->attributes, ds->limit,
+                 (unsigned long long)ds->base,
+                 es->selector, es->attributes, es->limit,
+                 (unsigned long long)es->base,
+                 fs->selector, fs->attributes, fs->limit,
+                 (unsigned long long)fs->base,
+                 gs->selector, gs->attributes, gs->limit,
+                 (unsigned long long)gs->base,
+                 gdtr->selector, gdtr->attributes, gdtr->limit,
+                 (unsigned long long)gdtr->base,
+                 idtr->selector, idtr->attributes, idtr->limit,
+                 (unsigned long long)idtr->base);
+}
+
+static void amdsvm_trace_pf_registers(
+    const char *stage, int vcpu,
+    const amdvm_x86_guest_state_v1_t *state)
+{
+    error_report("AMDVM_PF_EXIT_REGISTERS stage=%s vcpu=%d cr2=0x%llx cr3=0x%llx cr4=0x%llx efer=0x%llx rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx rsi=0x%llx rdi=0x%llx rbp=0x%llx rsp=0x%llx r8=0x%llx r9=0x%llx r10=0x%llx r11=0x%llx r12=0x%llx r13=0x%llx r14=0x%llx r15=0x%llx",
+        stage, vcpu,
+        (unsigned long long)state->cr[2],
+        (unsigned long long)state->cr[3],
+        (unsigned long long)state->cr[4],
+        (unsigned long long)state->efer,
+        (unsigned long long)state->gpr[AMDSVM_GPR_RAX],
+        (unsigned long long)state->gpr[AMDSVM_GPR_RBX],
+        (unsigned long long)state->gpr[AMDSVM_GPR_RCX],
+        (unsigned long long)state->gpr[AMDSVM_GPR_RDX],
+        (unsigned long long)state->gpr[AMDSVM_GPR_RSI],
+        (unsigned long long)state->gpr[AMDSVM_GPR_RDI],
+        (unsigned long long)state->gpr[AMDSVM_GPR_RBP],
+        (unsigned long long)state->gpr[AMDSVM_GPR_RSP],
+        (unsigned long long)state->gpr[AMDSVM_GPR_R8],
+        (unsigned long long)state->gpr[AMDSVM_GPR_R9],
+        (unsigned long long)state->gpr[AMDSVM_GPR_R10],
+        (unsigned long long)state->gpr[AMDSVM_GPR_R11],
+        (unsigned long long)state->gpr[AMDSVM_GPR_R12],
+        (unsigned long long)state->gpr[AMDSVM_GPR_R13],
+        (unsigned long long)state->gpr[AMDSVM_GPR_R14],
+        (unsigned long long)state->gpr[AMDSVM_GPR_R15]);
 }
 
 static AMDVMFaultMemorySection amdsvm_current_memory_section(uint64_t gpa)
 {
     AMDVMFaultMemorySection section = { .gpa = gpa };
-    FlatView *flatview = address_space_to_flatview(&address_space_memory);
+    MemoryRegionSection mrs;
+    MemoryRegion *mr;
+    uint64_t ram_offset;
+    void *ram_ptr;
 
-    flatview_for_each_range(flatview, amdsvm_find_fault_memory_section,
-                            &section);
+    if (gpa == UINT64_MAX) {
+        return section;
+    }
+
+    /*
+     * NPF diagnostics call this helper on every fault.  Walking every
+     * FlatView range made a late MMIO GPA such as HPET/APIC scan the whole
+     * memory map for each exit.  memory_region_find() uses FlatView lookup
+     * to select the covering range directly and returns the rest of that
+     * mapping from @gpa, which is also the bound needed by ROM shadow copies.
+     */
+    mrs = memory_region_find(get_system_memory(), gpa, UINT64_MAX - gpa);
+    mr = mrs.mr;
+    if (!mr) {
+        return section;
+    }
+    if (int128_gethi(mrs.size) != 0 || int128_getlo(mrs.size) == 0) {
+        memory_region_unref(mr);
+        return section;
+    }
+
+    section.found = true;
+    section.range_gpa = mrs.offset_within_address_space;
+    section.size = int128_getlo(mrs.size);
+    section.name = memory_region_name(mr);
+    section.is_ram = memory_region_is_ram(mr);
+    section.is_rom = memory_region_is_rom(mr);
+    if (section.is_ram && mrs.offset_within_region <= UINT64_MAX -
+            (gpa - section.range_gpa)) {
+        ram_offset = mrs.offset_within_region + (gpa - section.range_gpa);
+        ram_ptr = memory_region_get_ram_ptr(mr);
+        if (ram_ptr && (uintptr_t)ram_ptr <= UINT64_MAX - ram_offset) {
+            section.hva = (uint64_t)(uintptr_t)ram_ptr + ram_offset;
+        }
+    }
+    memory_region_unref(mr);
     return section;
 }
 
@@ -141,6 +368,31 @@ static void amdsvm_trace_smp_memory_map(const char *stage,
     }
 }
 
+#define AMDSVM_PERF_EXIT_CODES 0x1000u
+#define AMDSVM_BQL_SPIN_BUDGET 128u
+
+typedef struct AMDVMPerfVCPU {
+    uint64_t runs;
+    uint64_t run_us;
+    uint64_t provider_call_us;
+    uint64_t bql_reacquire_us;
+    uint64_t bql_spin_attempts;
+    uint64_t bql_spin_acquired;
+    uint64_t bql_spin_fallback;
+    uint64_t state_load_us;
+    uint64_t state_store_us;
+    uint64_t dispatch_us;
+    uint64_t exit_count[AMDSVM_PERF_EXIT_CODES];
+    uint64_t exit_us[AMDSVM_PERF_EXIT_CODES];
+    uint64_t npf_hpet;
+    uint64_t npf_lapic;
+    uint64_t npf_other;
+} AMDVMPerfVCPU;
+
+typedef struct AMDVMPerfStats {
+    AMDVMPerfVCPU vcpu[AMDVM_VM_ABI_DRAFT_MAX_VCPUS];
+} AMDVMPerfStats;
+
 struct AMDVMAccelState {
     AccelState parent_obj;
     bool confirm_no_kdp_watchpoints;
@@ -149,17 +401,34 @@ struct AMDVMAccelState {
     bool confirm_finite_smp_test;
     bool confirm_experimental_run;
     bool finite_host_tlb_stress;
+    bool perf_stats;
+    AMDVMPerfStats *perf_stats_data;
+    VMChangeStateEntry *perf_state_entry;
     bool trace_vmexit;
+    bool diagnostic_cr0_window_trace;
+    bool diagnostic_transition_irq_gate;
+    bool diagnostic_gp_intercept;
+    bool diagnostic_first_pf;
     bool diagnostic_only;
     bool diagnostic_finished;
     bool diagnostic_validate_ram_map;
     bool validate_finite_smp_rom;
     bool vm_api;
+    bool bql_spin_enabled;
+    bool mtrr_cache_enabled;
+    bool provider_pause_enabled;
+    bool shared_run_enabled;
+    bool native_rdtsc_enabled;
+    bool native_cr3_enabled;
+    uint32_t host_phys_bits;
     bool vm_api_prepared;
     bool vm_api_prepare_failed;
     bool vm_api_fpu_preflight_done;
     unsigned vm_expected_cpus;
     AMDVMVMProvider vm_provider;
+    mach_vm_address_t shared_run_mapping_address;
+    mach_vm_size_t shared_run_mapping_size;
+    bool shared_run_mapped;
     uint64_t vm_kick_generation[AMDVM_VM_ABI_DRAFT_MAX_VCPUS];
     char *debugcon;
     CharFrontend debugcon_frontend;
@@ -169,6 +438,8 @@ struct AMDVMAccelState {
     bool provider_prepare_failed;
     bool guest_map_initialized;
     bool provider_halted[AMDVM_VM_ABI_DRAFT_MAX_VCPUS];
+    bool diagnostic_gp_rearm_pending[AMDVM_VM_ABI_DRAFT_MAX_VCPUS];
+    unsigned diagnostic_gp_count[AMDVM_VM_ABI_DRAFT_MAX_VCPUS];
     AMDVMGuestMemoryMap guest_map;
     uint64_t guest_page_count;
     bool memory_types_published[AMDVM_VM_ABI_DRAFT_MAX_VCPUS];
@@ -176,8 +447,15 @@ struct AMDVMAccelState {
     uint64_t kick_generation;
     uint64_t trace_run_attempts;
     uint64_t trace_vcpu_run_attempts[AMDVM_VM_ABI_DRAFT_MAX_VCPUS];
+    uint64_t kernel_gpr_trace_count[AMDVM_VM_ABI_DRAFT_MAX_VCPUS];
+    uint64_t transition_event_trace_count[AMDVM_VM_ABI_DRAFT_MAX_VCPUS];
+    uint64_t kernel_event_trace_count[AMDVM_VM_ABI_DRAFT_MAX_VCPUS];
+    uint64_t kernel_exception_trace_count[AMDVM_VM_ABI_DRAFT_MAX_VCPUS];
+    uint64_t transition_irq_gate_count[AMDVM_VM_ABI_DRAFT_MAX_VCPUS];
     QemuMutex kick_lock;
     bool kick_lock_initialized;
+    QemuMutex vm_context_lock;
+    bool vm_context_lock_initialized;
     QemuThread host_tlb_threads[16];
     AMDVMHostTLBReaderArgs host_tlb_reader_args[15];
     volatile uint8_t *host_tlb_page;
@@ -192,6 +470,244 @@ struct AMDVMAccelState {
     AMDVMEventState pending_events[AMDVM_VM_ABI_DRAFT_MAX_VCPUS];
     amdvm_probe_result_t cpu_state_before;
 };
+
+static inline bool amdsvm_perf_enabled(const AMDVMAccelState *state)
+{
+    return state && state->perf_stats_data;
+}
+
+static bool amdsvm_bql_try_acquire(void *opaque)
+{
+    (void)opaque;
+    return bql_trylock();
+}
+
+static void amdsvm_bql_relax(void *opaque)
+{
+    (void)opaque;
+    cpu_relax();
+}
+
+static inline void amdsvm_perf_record_state_load(AMDVMAccelState *state,
+                                                   int vcpu, int64_t us)
+{
+    if (amdsvm_perf_enabled(state) && vcpu >= 0 &&
+        vcpu < AMDVM_VM_ABI_DRAFT_MAX_VCPUS) {
+        qatomic_fetch_add(&state->perf_stats_data->vcpu[vcpu].state_load_us,
+                          (uint64_t)us);
+    }
+}
+
+static inline void amdsvm_perf_record_state_store(AMDVMAccelState *state,
+                                                    int vcpu, int64_t us)
+{
+    if (amdsvm_perf_enabled(state) && vcpu >= 0 &&
+        vcpu < AMDVM_VM_ABI_DRAFT_MAX_VCPUS) {
+        qatomic_fetch_add(&state->perf_stats_data->vcpu[vcpu].state_store_us,
+                          (uint64_t)us);
+    }
+}
+
+static inline void amdsvm_perf_record_dispatch(AMDVMAccelState *state,
+                                                int vcpu, int64_t us)
+{
+    if (amdsvm_perf_enabled(state) && vcpu >= 0 &&
+        vcpu < AMDVM_VM_ABI_DRAFT_MAX_VCPUS) {
+        qatomic_fetch_add(&state->perf_stats_data->vcpu[vcpu].dispatch_us,
+                          (uint64_t)us);
+    }
+}
+
+static inline void amdsvm_perf_record_run(AMDVMAccelState *state, int vcpu,
+                                          uint64_t exit_code, int64_t us,
+                                          int64_t provider_call_us,
+                                          int64_t bql_reacquire_us,
+                                          const AMDVMBQLSpinResult *bql_spin,
+                                          uint64_t exit_gpa)
+{
+    AMDVMPerfVCPU *perf;
+
+    if (!amdsvm_perf_enabled(state) || vcpu < 0 ||
+        vcpu >= AMDVM_VM_ABI_DRAFT_MAX_VCPUS) {
+        return;
+    }
+    perf = &state->perf_stats_data->vcpu[vcpu];
+    qatomic_fetch_add(&perf->runs, 1);
+    qatomic_fetch_add(&perf->run_us, (uint64_t)us);
+    qatomic_fetch_add(&perf->provider_call_us,
+                      (uint64_t)provider_call_us);
+    qatomic_fetch_add(&perf->bql_reacquire_us,
+                      (uint64_t)bql_reacquire_us);
+    if (bql_spin) {
+        qatomic_fetch_add(&perf->bql_spin_attempts, bql_spin->attempts);
+        qatomic_fetch_add(&perf->bql_spin_acquired, bql_spin->acquired);
+        qatomic_fetch_add(&perf->bql_spin_fallback, !bql_spin->acquired);
+    }
+    if (exit_code < AMDSVM_PERF_EXIT_CODES) {
+        qatomic_fetch_add(&perf->exit_count[exit_code], 1);
+        qatomic_fetch_add(&perf->exit_us[exit_code], (uint64_t)us);
+    }
+    if (exit_code == SVM_EXIT_NPF) {
+        uint64_t page = exit_gpa & ~0xfffull;
+        if (page == 0xfed00000ull) {
+            perf->npf_hpet++;
+        } else if (page == 0xfee00000ull) {
+            perf->npf_lapic++;
+        } else {
+            perf->npf_other++;
+        }
+    }
+}
+
+static void amdsvm_perf_dump(AMDVMAccelState *state, const char *reason)
+{
+    const char *path;
+    char *default_path = NULL;
+    FILE *file;
+    uint64_t *counts;
+    uint64_t *times;
+    uint64_t runs = 0;
+    uint64_t run_us = 0;
+    uint64_t provider_call_us = 0;
+    uint64_t bql_reacquire_us = 0;
+    uint64_t bql_spin_attempts = 0;
+    uint64_t bql_spin_acquired = 0;
+    uint64_t bql_spin_fallback = 0;
+    uint64_t npf_hpet = 0;
+    uint64_t npf_lapic = 0;
+    uint64_t npf_other = 0;
+    uint64_t state_load_us = 0;
+    uint64_t state_store_us = 0;
+    uint64_t dispatch_us = 0;
+    unsigned i;
+
+    if (!amdsvm_perf_enabled(state)) {
+        return;
+    }
+    path = getenv("AMDVM_PERF_STATS_PATH");
+    if (!path || !*path) {
+        default_path = g_strdup_printf("/tmp/amdsvm-perf-%ld.txt",
+                                       (long)getpid());
+        path = default_path;
+    }
+    file = fopen(path, "w");
+    if (!file) {
+        error_report("AMDVM_PERF_STATS could not open %s: %s",
+                     path, strerror(errno));
+        g_free(default_path);
+        return;
+    }
+
+    counts = g_new0(uint64_t, AMDSVM_PERF_EXIT_CODES);
+    times = g_new0(uint64_t, AMDSVM_PERF_EXIT_CODES);
+    for (i = 0; i < AMDVM_VM_ABI_DRAFT_MAX_VCPUS; i++) {
+        AMDVMPerfVCPU *perf = &state->perf_stats_data->vcpu[i];
+        unsigned code;
+
+        runs += qatomic_read(&perf->runs);
+        run_us += qatomic_read(&perf->run_us);
+        provider_call_us += qatomic_read(&perf->provider_call_us);
+        bql_reacquire_us += qatomic_read(&perf->bql_reacquire_us);
+        bql_spin_attempts += qatomic_read(&perf->bql_spin_attempts);
+        bql_spin_acquired += qatomic_read(&perf->bql_spin_acquired);
+        bql_spin_fallback += qatomic_read(&perf->bql_spin_fallback);
+        npf_hpet += perf->npf_hpet;
+        npf_lapic += perf->npf_lapic;
+        npf_other += perf->npf_other;
+        state_load_us += qatomic_read(&perf->state_load_us);
+        state_store_us += qatomic_read(&perf->state_store_us);
+        dispatch_us += qatomic_read(&perf->dispatch_us);
+        for (code = 0; code < AMDSVM_PERF_EXIT_CODES; code++) {
+            counts[code] += qatomic_read(&perf->exit_count[code]);
+            times[code] += qatomic_read(&perf->exit_us[code]);
+        }
+    }
+
+    fprintf(file, "amdsvm_perf version=1 pid=%ld reason=%s\n",
+            (long)getpid(), reason ? reason : "unknown");
+    fprintf(file,
+            "totals runs=%" PRIu64 " run_us=%" PRIu64
+            " provider_call_us=%" PRIu64 " bql_reacquire_us=%" PRIu64
+            " bql_spin_attempts=%" PRIu64 " bql_spin_acquired=%" PRIu64
+            " bql_spin_fallback=%" PRIu64
+            " npf_hpet=%" PRIu64 " npf_lapic=%" PRIu64
+            " npf_other=%" PRIu64
+            " state_load_us=%" PRIu64 " state_store_us=%" PRIu64
+            " dispatch_us=%" PRIu64 "\n",
+            runs, run_us, provider_call_us, bql_reacquire_us,
+            bql_spin_attempts, bql_spin_acquired, bql_spin_fallback,
+            npf_hpet, npf_lapic, npf_other,
+            state_load_us, state_store_us, dispatch_us);
+    for (i = 0; i < AMDVM_VM_ABI_DRAFT_MAX_VCPUS; i++) {
+        AMDVMPerfVCPU *perf = &state->perf_stats_data->vcpu[i];
+
+        if (!qatomic_read(&perf->runs)) {
+            continue;
+        }
+        fprintf(file,
+                "vcpu id=%u runs=%" PRIu64 " run_us=%" PRIu64
+                " provider_call_us=%" PRIu64
+                " bql_reacquire_us=%" PRIu64
+                " bql_spin_attempts=%" PRIu64
+                " bql_spin_acquired=%" PRIu64
+                " bql_spin_fallback=%" PRIu64
+                " state_load_us=%" PRIu64 " state_store_us=%" PRIu64
+                " dispatch_us=%" PRIu64 "\n",
+                i, qatomic_read(&perf->runs),
+                qatomic_read(&perf->run_us),
+                qatomic_read(&perf->provider_call_us),
+                qatomic_read(&perf->bql_reacquire_us),
+                qatomic_read(&perf->bql_spin_attempts),
+                qatomic_read(&perf->bql_spin_acquired),
+                qatomic_read(&perf->bql_spin_fallback),
+                qatomic_read(&perf->state_load_us),
+                qatomic_read(&perf->state_store_us),
+                qatomic_read(&perf->dispatch_us));
+    }
+    for (i = 0; i < AMDSVM_PERF_EXIT_CODES; i++) {
+        if (!counts[i]) {
+            continue;
+        }
+        fprintf(file,
+                "exit code=0x%03x count=%" PRIu64 " run_us=%" PRIu64
+                " avg_us=%.2f\n",
+                i, counts[i], times[i],
+                (double)times[i] / (double)counts[i]);
+    }
+    fclose(file);
+    error_report("AMDVM_PERF_STATS path=%s reason=%s runs=%" PRIu64
+                 " run_us=%" PRIu64
+                 " provider_call_us=%" PRIu64
+                 " bql_reacquire_us=%" PRIu64
+                 " state_load_us=%" PRIu64
+                 " state_store_us=%" PRIu64 " dispatch_us=%" PRIu64,
+                 path, reason ? reason : "unknown", runs, run_us,
+                 provider_call_us, bql_reacquire_us,
+                 state_load_us, state_store_us, dispatch_us);
+    g_free(times);
+    g_free(counts);
+    g_free(default_path);
+}
+
+static void amdsvm_perf_vm_state_change(void *opaque, bool running,
+                                        RunState state)
+{
+    AMDVMAccelState *accel = opaque;
+
+    (void)state;
+    if (!running) {
+        if (accel->vm_api &&
+            (accel->vm_provider.caps.feature_flags &
+             AMDVM_VM_ABI_DRAFT_FEATURE_PROVIDER_PAUSE_STATS_V1)) {
+            int rc = amdsvm_vm_provider_report_pause_stats(&accel->vm_provider);
+            if (rc && rc != -EAGAIN) {
+                error_report("AMD-SVM PAUSE counters could not be reported on VM stop (%d)",
+                             rc);
+            }
+        }
+        amdsvm_perf_dump(accel, "vm_stop");
+    }
+}
 
 static void *amdsvm_host_tlb_mprotect_thread(void *opaque)
 {
@@ -439,6 +955,113 @@ static void amdsvm_set_trace_vmexit(Object *obj, bool value, Error **errp)
     s->trace_vmexit = value;
 }
 
+static bool amdsvm_get_perf_stats(Object *obj, Error **errp)
+{
+    AMDVMAccelState *s = (AMDVMAccelState *)obj;
+
+    (void)errp;
+    return s->perf_stats;
+}
+
+static void amdsvm_set_perf_stats(Object *obj, bool value, Error **errp)
+{
+    AMDVMAccelState *s = (AMDVMAccelState *)obj;
+
+    (void)errp;
+    s->perf_stats = value;
+}
+
+static bool amdsvm_get_diagnostic_cr0_window_trace(Object *obj,
+                                                    Error **errp)
+{
+    AMDVMAccelState *s = (AMDVMAccelState *)obj;
+
+    (void)errp;
+    return s->diagnostic_cr0_window_trace;
+}
+
+static void amdsvm_set_diagnostic_cr0_window_trace(Object *obj, bool value,
+                                                    Error **errp)
+{
+    AMDVMAccelState *s = (AMDVMAccelState *)obj;
+
+    (void)errp;
+    s->diagnostic_cr0_window_trace = value;
+}
+
+static bool amdsvm_cr0_window_contains(
+    const amdvm_x86_guest_state_v1_t *state)
+{
+    return state && state->rip >= 0x8a0 && state->rip <= 0x8ef;
+}
+
+static void amdsvm_trace_cr0_window(const char *stage, int vcpu,
+                                    const amdvm_x86_guest_state_v1_t *state,
+                                    uint64_t exit_code,
+                                    const char *entry_status)
+{
+    if (!state) {
+        return;
+    }
+    error_report("AMDVM_CR0_WINDOW stage=%s vcpu=%d rip=0x%llx cr0=0x%llx pe=%u exit=0x%llx vmcb_entry=%s",
+                 stage, vcpu, (unsigned long long)state->rip,
+                 (unsigned long long)state->cr[0],
+                 (unsigned)(state->cr[0] & 1u),
+                 (unsigned long long)exit_code, entry_status);
+}
+
+static bool amdsvm_get_diagnostic_transition_irq_gate(Object *obj,
+                                                       Error **errp)
+{
+    AMDVMAccelState *s = (AMDVMAccelState *)obj;
+
+    (void)errp;
+    return s->diagnostic_transition_irq_gate;
+}
+
+static void amdsvm_set_diagnostic_transition_irq_gate(Object *obj, bool value,
+                                                       Error **errp)
+{
+    AMDVMAccelState *s = (AMDVMAccelState *)obj;
+
+    (void)errp;
+    s->diagnostic_transition_irq_gate = value;
+}
+
+static bool amdsvm_get_diagnostic_gp_intercept(Object *obj, Error **errp)
+{
+    AMDVMAccelState *s = (AMDVMAccelState *)obj;
+
+    (void)errp;
+    return s->diagnostic_gp_intercept;
+}
+
+static void amdsvm_set_diagnostic_gp_intercept(Object *obj, bool value,
+                                               Error **errp)
+{
+    AMDVMAccelState *s = (AMDVMAccelState *)obj;
+
+    (void)errp;
+    s->diagnostic_gp_intercept = value;
+}
+
+static bool amdsvm_get_diagnostic_first_pf(Object *obj, Error **errp)
+{
+    AMDVMAccelState *s = (AMDVMAccelState *)obj;
+
+    (void)errp;
+    return s->diagnostic_first_pf;
+}
+
+static void amdsvm_set_diagnostic_first_pf(Object *obj, bool value,
+                                           Error **errp)
+{
+    AMDVMAccelState *s = (AMDVMAccelState *)obj;
+
+    (void)errp;
+    s->diagnostic_first_pf = value;
+}
+
 static bool amdsvm_get_diagnostic_only(Object *obj, Error **errp)
 {
     AMDVMAccelState *s = (AMDVMAccelState *)obj;
@@ -494,6 +1117,78 @@ static bool amdsvm_get_vm_api(Object *obj, Error **errp)
 static void amdsvm_set_vm_api(Object *obj, bool value, Error **errp)
 {
     ((AMDVMAccelState *)obj)->vm_api = value;
+}
+
+static bool amdsvm_get_bql_spin(Object *obj, Error **errp)
+{
+    (void)errp;
+    return ((AMDVMAccelState *)obj)->bql_spin_enabled;
+}
+
+static void amdsvm_set_bql_spin(Object *obj, bool value, Error **errp)
+{
+    (void)errp;
+    ((AMDVMAccelState *)obj)->bql_spin_enabled = value;
+}
+
+static bool amdsvm_get_mtrr_cache(Object *obj, Error **errp)
+{
+    (void)errp;
+    return ((AMDVMAccelState *)obj)->mtrr_cache_enabled;
+}
+
+static void amdsvm_set_mtrr_cache(Object *obj, bool value, Error **errp)
+{
+    (void)errp;
+    ((AMDVMAccelState *)obj)->mtrr_cache_enabled = value;
+}
+
+static bool amdsvm_get_provider_pause(Object *obj, Error **errp)
+{
+    (void)errp;
+    return ((AMDVMAccelState *)obj)->provider_pause_enabled;
+}
+
+static void amdsvm_set_provider_pause(Object *obj, bool value, Error **errp)
+{
+    (void)errp;
+    ((AMDVMAccelState *)obj)->provider_pause_enabled = value;
+}
+
+static bool amdsvm_get_shared_run(Object *obj, Error **errp)
+{
+    (void)errp;
+    return ((AMDVMAccelState *)obj)->shared_run_enabled;
+}
+
+static void amdsvm_set_shared_run(Object *obj, bool value, Error **errp)
+{
+    (void)errp;
+    ((AMDVMAccelState *)obj)->shared_run_enabled = value;
+}
+
+static bool amdsvm_get_native_rdtsc(Object *obj, Error **errp)
+{
+    (void)errp;
+    return ((AMDVMAccelState *)obj)->native_rdtsc_enabled;
+}
+
+static void amdsvm_set_native_rdtsc(Object *obj, bool value, Error **errp)
+{
+    (void)errp;
+    ((AMDVMAccelState *)obj)->native_rdtsc_enabled = value;
+}
+
+static bool amdsvm_get_native_cr3(Object *obj, Error **errp)
+{
+    (void)errp;
+    return ((AMDVMAccelState *)obj)->native_cr3_enabled;
+}
+
+static void amdsvm_set_native_cr3(Object *obj, bool value, Error **errp)
+{
+    (void)errp;
+    ((AMDVMAccelState *)obj)->native_cr3_enabled = value;
 }
 
 static int amdsvm_call(io_connect_t connection, uint32_t selector,
@@ -557,7 +1252,7 @@ static bool amdsvm_reset_diagnostic_matches(
     return true;
 }
 
-/* Permit the early hardware stop experiment only with this exact ROM. */
+/* Permit the pre-Alpine hardware stop experiment only with this exact ROM. */
 static bool amdsvm_finite_kick_rom_matches(const uint8_t *reset_page)
 {
     static const uint8_t payload_prefix[] = {
@@ -884,7 +1579,7 @@ static void amdsvm_kick_vcpu_thread(CPUState *cpu)
             generation = 1;
         }
         rc = amdsvm_vm_provider_kick(&state->vm_provider,
-                                     cpu->cpu_index, generation);
+                                     cpu->cpu_index, generation, &generation);
         if (rc == -EAGAIN || rc == -ESHUTDOWN) {
             /* A QEMU kick can race VM preparation or final destroy. */
         } else if (rc) {
@@ -1249,14 +1944,22 @@ typedef struct AMDVMFirmwareDispatchContext {
     AMDVMEventState *pending_events;
     CharFrontend *debugcon;
     bool debugcon_initialized;
+    bool defer_external_irq_completion;
 } AMDVMFirmwareDispatchContext;
 
 static int amdsvm_firmware_store_state(
     void *opaque, const amdvm_x86_guest_state_v1_t *state)
 {
     AMDVMFirmwareDispatchContext *ctx = opaque;
+    int64_t started_us = amdsvm_perf_enabled(ctx->accel_state) ?
+        g_get_monotonic_time() : 0;
+    int ret = amdsvm_state_store(ctx->cpu, state);
 
-    return amdsvm_state_store(ctx->cpu, state);
+    if (started_us) {
+        amdsvm_perf_record_state_store(ctx->accel_state, ctx->cpu->cpu_index,
+                                       g_get_monotonic_time() - started_us);
+    }
+    return ret;
 }
 
 static int amdsvm_firmware_complete_event(void *opaque,
@@ -1265,6 +1968,13 @@ static int amdsvm_firmware_complete_event(void *opaque,
                                           amdvm_x86_guest_state_v1_t *state)
 {
     AMDVMFirmwareDispatchContext *ctx = opaque;
+
+    /* A transition-window diagnostic can defer a pending external IRQ
+     * without acknowledging or dropping it. Keep it queued until a later
+     * RUN actually offers the event to the processor. */
+    if (ctx->defer_external_irq_completion) {
+        return 0;
+    }
 
     return amdsvm_event_complete(ctx->pending_events, exit_code,
                                  exit_int_info, state);
@@ -1296,6 +2006,19 @@ static int amdsvm_firmware_rdtsc(void *opaque, uint64_t *value)
     AMDVMFirmwareDispatchContext *ctx = opaque;
 
     return amdsvm_state_read_tsc(ctx->cpu, value);
+}
+
+static int amdsvm_firmware_rdtscp(void *opaque, uint64_t *value,
+                                  uint32_t *aux)
+{
+    AMDVMFirmwareDispatchContext *ctx = opaque;
+    int ret;
+
+    ret = amdsvm_state_read_tsc(ctx->cpu, value);
+    if (ret == 0) {
+        ret = amdsvm_state_read_tsc_aux(ctx->cpu, aux);
+    }
+    return ret;
 }
 
 static AMDVMFirmwareDispatchAction amdsvm_firmware_xsetbv(
@@ -1407,6 +2130,16 @@ static AMDVMFirmwareDispatchAction amdsvm_firmware_cr(
     AMDVMFirmwareDispatchContext *ctx = opaque;
     Error *error = NULL;
     uint32_t event_injection = 0, event_error_code = 0;
+    amdvm_x86_guest_state_v1_t qemu_before = { 0 };
+    amdvm_x86_guest_state_v1_t qemu_after = { 0 };
+    bool trace_cr0_write = ctx && ctx->accel_state &&
+        ctx->accel_state->diagnostic_cr0_window_trace &&
+        result && result->exit_code == SVM_EXIT_WRITE_CR0 &&
+        (amdsvm_cr0_window_contains(&result->state) ||
+         (result->next_rip >= 0x8a0 && result->next_rip <= 0x8ef));
+    if (trace_cr0_write) {
+        (void)amdsvm_state_load(ctx->cpu, &qemu_before);
+    }
 
     if (!amdsvm_handle_cr_exit(ctx->cpu, result->exit_code,
                                result->exit_info1, result->next_rip,
@@ -1415,6 +2148,27 @@ static AMDVMFirmwareDispatchAction amdsvm_firmware_cr(
             error_report_err(error);
         }
         return AMDVM_FIRMWARE_DISPATCH_ERROR;
+    }
+    if (trace_cr0_write) {
+        if (amdsvm_state_load(ctx->cpu, &qemu_after) != 0) {
+            error_report("AMDVM_CR0_WINDOW stage=CR0_WRITE vcpu=%d rip=0x%llx next_rip=0x%llx before_cr0=0x%llx before_pe=%u after_cr0=unavailable after_pe=unavailable qemu_state=unavailable vmcb_entry=unavailable",
+                         ctx->cpu->cpu_index,
+                         (unsigned long long)result->state.rip,
+                         (unsigned long long)result->next_rip,
+                         (unsigned long long)qemu_before.cr[0],
+                         (unsigned)(qemu_before.cr[0] & 1u));
+        } else {
+            error_report("AMDVM_CR0_WINDOW stage=CR0_WRITE vcpu=%d rip=0x%llx next_rip=0x%llx vmexit_cr0=0x%llx vmexit_pe=%u qemu_before_cr0=0x%llx qemu_before_pe=%u qemu_after_cr0=0x%llx qemu_after_pe=%u vmcb_entry=unavailable",
+                         ctx->cpu->cpu_index,
+                         (unsigned long long)result->state.rip,
+                         (unsigned long long)result->next_rip,
+                         (unsigned long long)result->state.cr[0],
+                         (unsigned)(result->state.cr[0] & 1u),
+                         (unsigned long long)qemu_before.cr[0],
+                         (unsigned)(qemu_before.cr[0] & 1u),
+                         (unsigned long long)qemu_after.cr[0],
+                         (unsigned)(qemu_after.cr[0] & 1u));
+        }
     }
     if (event_injection != 0 &&
         amdsvm_event_queue_exception(ctx->pending_events, event_injection,
@@ -1730,6 +2484,9 @@ static AMDVMFirmwareDispatchAction amdsvm_firmware_process_events(
 
 static AMDVMFirmwareDispatchAction amdsvm_firmware_physical_intr(void *opaque)
 {
+    /* This is a physical host interrupt (for example an XNU IPI), not a
+     * guest EVENTINJ. Always service QEMU and provider async events before
+     * re-entering the guest. Deferring this path can starve host work. */
     return amdsvm_firmware_process_events(opaque);
 }
 
@@ -1820,8 +2577,17 @@ static int amdsvm_vm_api_prepare(AMDVMAccelState *state)
     CPU_FOREACH(cpu) {
         AMDVMMTRRState mtrr;
         amdvm_vcpu_set_memory_types_request_t memory_types = {0};
-        if (cpu->cpu_index < 0 ||
-            amdsvm_vm_provider_create(&state->vm_provider, cpu->cpu_index,
+        if (cpu->cpu_index < 0) {
+            error_report("AMD-SVM VM API invalid CPU index %d", cpu->cpu_index);
+            goto failed;
+        }
+        /* APs are initialized on their first SIPI/run, not during BSP setup.
+         * Early SeaBIOS map updates otherwise rebuild every selected vCPU's
+         * pinned-memory/NPT context before the guest has started those APs. */
+        if (cpu->cpu_index != 0) {
+            continue;
+        }
+        if (amdsvm_vm_provider_create(&state->vm_provider, cpu->cpu_index,
                                       amdsvm_state_apic_id(cpu)) ||
             amdsvm_state_load(cpu, snapshot) ||
             amdsvm_vm_provider_state_roundtrip(&state->vm_provider, cpu->cpu_index, snapshot)) {
@@ -1954,7 +2720,7 @@ static int amdsvm_vm_api_prepare(AMDVMAccelState *state)
         state->memory_types_published[cpu->cpu_index] = true;
         ++prepared;
     }
-    if (prepared != state->vm_expected_cpus) {
+    if (prepared != 1) {
         goto failed;
     }
     state->guest_map = *map;
@@ -1970,6 +2736,83 @@ failed:
         error_report("AMD-SVM VM API cleanup failed; connection retained");
     }
     return -EIO;
+}
+
+/* Prepare an AP only when QEMU has made it runnable (typically after SIPI).
+ * The VM map is already committed; context allocation and NPT construction
+ * are serialized against sibling creation and map refresh. */
+static int amdsvm_vm_api_ensure_vcpu(AMDVMAccelState *state, CPUState *cpu)
+{
+    amdvm_x86_guest_state_v1_t snapshot = {0};
+    amdvm_vm_abi_draft_vcpu_diagnostic_result_t diagnostic = {0};
+    amdvm_vcpu_set_memory_types_request_t memory_types = {0};
+    AMDVMMTRRState mtrr;
+    uint32_t required_npt_flags =
+        AMDVM_VM_ABI_DRAFT_VCPU_DIAG_NPT_ENABLED |
+        AMDVM_VM_ABI_DRAFT_VCPU_DIAG_NPT_ROOT_MATCH |
+        AMDVM_VM_ABI_DRAFT_VCPU_DIAG_RESET_TRANSLATES |
+        AMDVM_VM_ABI_DRAFT_VCPU_DIAG_RESET_BACKING_MATCH |
+        AMDVM_VM_ABI_DRAFT_VCPU_DIAG_APIC_UNMAPPED;
+    unsigned id;
+    int rc = -EIO;
+
+    if (!state || !cpu || !state->vm_api_prepared ||
+        cpu->cpu_index < 0 ||
+        cpu->cpu_index >= AMDVM_VM_ABI_DRAFT_MAX_VCPUS) {
+        return -EINVAL;
+    }
+    id = cpu->cpu_index;
+    qemu_mutex_lock(&state->vm_context_lock);
+    if (qatomic_read(&state->vm_provider.cpus[id])) {
+        rc = 0;
+        goto out;
+    }
+    if (amdsvm_vm_provider_create(&state->vm_provider, id,
+                                  amdsvm_state_apic_id(cpu)) ||
+        amdsvm_state_load(cpu, &snapshot) ||
+        amdsvm_vm_provider_state_roundtrip(&state->vm_provider, id,
+                                           &snapshot)) {
+        error_report("AMD-SVM VM API CPU %u lazy context/state preparation failed", id);
+        goto out;
+    }
+    amdsvm_state_get_mtrr(cpu, &mtrr);
+    Error *err = NULL;
+    if (!amdsvm_build_memory_type_request(&state->guest_map, &mtrr,
+            AMDVM_GUEST_MTRR_COMPAT_ALL_WB, &memory_types, &err)) {
+        error_report_err(err);
+        goto failed_vcpu;
+    }
+    if (amdsvm_vm_provider_set_memory_types(&state->vm_provider, id,
+                                            &memory_types) ||
+        amdsvm_vm_provider_diagnostic(&state->vm_provider, id,
+                                      &diagnostic) != 0 ||
+        diagnostic.context_status != 0 ||
+        (diagnostic.flags & required_npt_flags) != required_npt_flags ||
+        diagnostic.reset_translation_status !=
+            AMDVM_VM_ABI_DRAFT_NPT_STATUS_MAPPED ||
+        diagnostic.apic_translation_status !=
+            AMDVM_VM_ABI_DRAFT_NPT_STATUS_UNMAPPED ||
+        memcmp(diagnostic.snapshot.entry_bytes,
+               state->guest_map.reset_rom_page + AMDVM_VCPU_RESET_ROM_OFFSET,
+               sizeof(diagnostic.snapshot.entry_bytes)) != 0) {
+        error_report("AMD-SVM VM API CPU %u lazy NPT preflight failed; VMRUN was not called",
+                     id);
+        goto failed_vcpu;
+    }
+    state->published_mtrr[id] = mtrr;
+    state->memory_types_published[id] = true;
+    error_report("AMD-SVM VM API CPU %u AP context prepared on demand", id);
+    rc = 0;
+    goto out;
+
+failed_vcpu:
+    if (amdsvm_vm_provider_destroy_vcpu(&state->vm_provider, id) != 0) {
+        error_report("AMD-SVM VM API CPU %u failed lazy context cleanup; connection retained",
+                     id);
+    }
+out:
+    qemu_mutex_unlock(&state->vm_context_lock);
+    return rc;
 }
 
 static int amdsvm_vm_api_diagnostic(AMDVMAccelState *state)
@@ -2023,9 +2866,23 @@ static int amdsvm_vm_api_run_once(AMDVMAccelState *state, CPUState *cpu,
                      state ? state->vm_api_prepared : 0);
         return -EINVAL;
     }
-    rc = amdsvm_vm_provider_run(&state->vm_provider, cpu->cpu_index,
+    bool native_rdtsc = state->native_rdtsc_enabled && !icount_enabled() &&
+        (state->vm_provider.caps.feature_flags &
+         AMDVM_VM_ABI_DRAFT_FEATURE_NATIVE_RDTSC_V1);
+    bool native_cr3 = state->native_cr3_enabled &&
+        (state->vm_provider.caps.feature_flags &
+         AMDVM_VM_ABI_DRAFT_FEATURE_NATIVE_CR3_V1) &&
+        amdsvm_native_cr3_policy_safe(amdsvm_state_phys_bits(cpu),
+            state->host_phys_bits, run->state.cr[4]);
+    uint64_t tsc_offset = 0;
+    if (native_rdtsc && amdsvm_state_get_native_tsc_offset(cpu,
+                                                           &tsc_offset) != 0) {
+        native_rdtsc = false;
+    }
+    rc = amdsvm_vm_provider_run_ex(&state->vm_provider, cpu->cpu_index,
         run->kick_generation, run->event_injection,
-        run->event_injection_error_code, &run->state, &vm_result);
+        run->event_injection_error_code, native_rdtsc, tsc_offset,
+        native_cr3, &run->state, &vm_result);
     if (rc == -ENOTSUP) {
         error_report("AMD-SVM provider RUN is fail-closed (ENTRY_GATED); no VMRUN was attempted");
     }
@@ -2160,6 +3017,11 @@ static int amdsvm_vm_api_refresh_map(AMDVMAccelState *state, CPUState *current,
     unsigned range_count = 0;
     int rc;
     bool resume_siblings = true;
+    int64_t refresh_started_us = g_get_monotonic_time();
+    int64_t pause_done_us = 0, ranges_done_us = 0, destroy_done_us = 0;
+    int64_t replace_done_us = 0, create_done_us = 0, kick_done_us = 0;
+    int64_t provider_create_us = 0, state_roundtrip_us = 0;
+    int64_t set_memory_types_us = 0;
 
     if (!state || !state->vm_api || !state->vm_api_prepared || !current ||
         !updated_map || !updated_map->reset_rom_page_present ||
@@ -2169,11 +3031,17 @@ static int amdsvm_vm_api_refresh_map(AMDVMAccelState *state, CPUState *current,
         error_report("AMD-SVM map refresh requires an unchanged reset-ROM page");
         return -ENOTSUP;
     }
+    /* Map replacement is expensive and happens only when FlatView meaning
+     * changed at an IOIO boundary. Capture both sides here to identify which
+     * GPA/HVA/permission delta made the refresh necessary. */
+    amdsvm_trace_smp_memory_map("refresh-old", &state->guest_map);
+    amdsvm_trace_smp_memory_map("refresh-new", updated_map);
     rc = amdsvm_vm_api_pause_siblings(state, current, paused);
     if (rc) {
         error_report("AMD-SVM could not drain sibling vCPUs within 5 seconds");
         return rc;
     }
+    pause_done_us = g_get_monotonic_time();
     ranges = g_new0(amdvm_vcpu_memory_range_t, AMDVM_VCPU_MEMORY_MAX_RANGES);
     for (unsigned i = 0; i < updated_map->count; ++i) {
         uint64_t offset = 0;
@@ -2203,6 +3071,7 @@ static int amdsvm_vm_api_refresh_map(AMDVMAccelState *state, CPUState *current,
             .flags = ranges[i].flags,
         };
     }
+    ranges_done_us = g_get_monotonic_time();
     CPU_FOREACH(cpu) {
         int id = cpu->cpu_index;
         if (id < 0 || id >= AMDVM_VM_ABI_DRAFT_MAX_VCPUS ||
@@ -2217,28 +3086,47 @@ static int amdsvm_vm_api_refresh_map(AMDVMAccelState *state, CPUState *current,
             goto out;
         }
     }
+    destroy_done_us = g_get_monotonic_time();
     rc = amdsvm_vm_provider_replace_map(&state->vm_provider, ranges, range_count);
     if (rc) {
         error_report("AMD-SVM provider rejected replacement map (%d)", rc);
         goto out;
     }
+    replace_done_us = g_get_monotonic_time();
     state->guest_map = provider_map;
     state->guest_page_count = updated_map->total_ram / AMDSVM_GUEST_PAGE_SIZE;
+    if (state->trace_vmexit) {
+        amdsvm_trace_smp_memory_map("refresh", &provider_map);
+    }
     CPU_FOREACH(cpu) {
         AMDVMMTRRState mtrr;
         g_autofree amdvm_x86_guest_state_v1_t *snapshot =
             g_new0(amdvm_x86_guest_state_v1_t, 1);
         amdvm_vcpu_set_memory_types_request_t memory_types = {0};
         int id = cpu->cpu_index;
-        if (id < 0 || id >= AMDVM_VM_ABI_DRAFT_MAX_VCPUS ||
-            amdsvm_vm_provider_create(&state->vm_provider, id,
-                                      amdsvm_state_apic_id(cpu)) ||
-            amdsvm_state_load(cpu, snapshot) ||
-            amdsvm_vm_provider_state_roundtrip(&state->vm_provider, id, snapshot)) {
+        int64_t phase_start_us;
+        if (id < 0 || id >= AMDVM_VM_ABI_DRAFT_MAX_VCPUS) {
+            error_report("AMD-SVM invalid vCPU index %d after map replace", id);
+            rc = -EIO;
+            goto out;
+        }
+        phase_start_us = g_get_monotonic_time();
+        if (amdsvm_vm_provider_create(&state->vm_provider, id,
+                                      amdsvm_state_apic_id(cpu))) {
             error_report("AMD-SVM failed to recreate vCPU %d after map replace", id);
             rc = -EIO;
             goto out;
         }
+        provider_create_us += g_get_monotonic_time() - phase_start_us;
+        phase_start_us = g_get_monotonic_time();
+        if (amdsvm_state_load(cpu, snapshot) ||
+            amdsvm_vm_provider_state_roundtrip(&state->vm_provider, id,
+                                                snapshot)) {
+            error_report("AMD-SVM failed to restore vCPU %d state after map replace", id);
+            rc = -EIO;
+            goto out;
+        }
+        state_roundtrip_us += g_get_monotonic_time() - phase_start_us;
         amdsvm_state_get_mtrr(cpu, &mtrr);
         if (!amdsvm_build_memory_type_request(&state->guest_map, &mtrr,
                 AMDVM_GUEST_MTRR_COMPAT_ALL_WB, &memory_types, &err)) {
@@ -2246,15 +3134,42 @@ static int amdsvm_vm_api_refresh_map(AMDVMAccelState *state, CPUState *current,
             rc = -ENOTSUP;
             goto out;
         }
+        phase_start_us = g_get_monotonic_time();
         if (amdsvm_vm_provider_set_memory_types(&state->vm_provider, id,
                                                 &memory_types)) {
             error_report("AMD-SVM failed to restore vCPU %d NPT memory types", id);
             rc = -EIO;
             goto out;
         }
+        set_memory_types_us += g_get_monotonic_time() - phase_start_us;
         state->published_mtrr[id] = mtrr;
         state->memory_types_published[id] = true;
     }
+    create_done_us = g_get_monotonic_time();
+    /*
+     * Recreated provider vCPUs have fresh kick-generation state. Re-latch a
+     * new kick for each one before resuming workers, otherwise the first RUN
+     * can be rejected forever as stale and spin at the reset vector.
+     */
+    CPU_FOREACH(cpu) {
+        int id = cpu->cpu_index;
+        uint64_t generation_before;
+
+        if (id < 0 || id >= AMDVM_VM_ABI_DRAFT_MAX_VCPUS ||
+            !qatomic_read(&state->vm_provider.cpus[id])) {
+            continue;
+        }
+        generation_before = qatomic_read(&state->vm_kick_generation[id]);
+        amdsvm_kick_vcpu_thread(cpu);
+        if (qatomic_read(&state->vm_kick_generation[id]) ==
+            generation_before) {
+            error_report("AMD-SVM failed to synchronize recreated vCPU %d kick generation",
+                         id);
+            rc = -EIO;
+            goto out;
+        }
+    }
+    kick_done_us = g_get_monotonic_time();
     resume_siblings = true;
     error_report("AMD-SVM VM RAM map replaced generation=%llu ranges=%u bytes=%llu",
                  (unsigned long long)state->vm_provider.generation, range_count,
@@ -2264,6 +3179,29 @@ out:
     if (resume_siblings) {
         amdsvm_vm_api_resume_siblings(current, paused);
     }
+    int64_t pause_us = pause_done_us ?
+        pause_done_us - refresh_started_us : -1;
+    int64_t ranges_us = (pause_done_us && ranges_done_us) ?
+        ranges_done_us - pause_done_us : -1;
+    int64_t destroy_us = (ranges_done_us && destroy_done_us) ?
+        destroy_done_us - ranges_done_us : -1;
+    int64_t replace_us = (destroy_done_us && replace_done_us) ?
+        replace_done_us - destroy_done_us : -1;
+    int64_t create_us = (replace_done_us && create_done_us) ?
+        create_done_us - replace_done_us : -1;
+    int64_t kick_us = (create_done_us && kick_done_us) ?
+        kick_done_us - create_done_us : -1;
+    int64_t total_us = g_get_monotonic_time() - refresh_started_us;
+    error_report("AMDVM_VM_REFRESH_TIMING vcpu=%d ranges=%u pause_us=%lld ranges_us=%lld destroy_us=%lld replace_us=%lld create_us=%lld provider_create_us=%lld state_roundtrip_us=%lld set_memory_types_us=%lld kick_us=%lld total_us=%lld rc=%d",
+                 current->cpu_index, range_count,
+                 (long long)pause_us, (long long)ranges_us,
+                 (long long)destroy_us, (long long)replace_us,
+                 (long long)create_us,
+                 (long long)provider_create_us,
+                 (long long)state_roundtrip_us,
+                 (long long)set_memory_types_us,
+                 (long long)kick_us,
+                 (long long)total_us, rc);
     return rc;
 }
 
@@ -2287,6 +3225,7 @@ static int amdsvm_run_qemu_firmware(CPUState *cpu,
         .handle_iret = amdsvm_firmware_handle_iret,
         .emulate_cpuid = amdsvm_firmware_cpuid,
         .emulate_rdtsc = amdsvm_firmware_rdtsc,
+        .emulate_rdtscp = amdsvm_firmware_rdtscp,
         .handle_xsetbv = amdsvm_firmware_xsetbv,
         .emulate_io = amdsvm_firmware_io,
         .emulate_string_io = amdsvm_firmware_string_io,
@@ -2303,6 +3242,7 @@ static int amdsvm_run_qemu_firmware(CPUState *cpu,
     bool vmrun_attempted = false;
     bool provider_prepared = false;
     unsigned int preentry_fpu_retry_count = 0;
+    uint64_t diagnostic_pf_reinjected = 0;
     int ret = -EIO;
 
     dispatch_context.cpu = cpu;
@@ -2431,16 +3371,24 @@ static int amdsvm_run_qemu_firmware(CPUState *cpu,
             ret = -EIO;
             goto out;
         }
-        if (memcmp(&guest_map, &accel_state->guest_map,
-                   sizeof(guest_map)) != 0) {
+        if (!amdsvm_memory_map_equal(&guest_map, &accel_state->guest_map)) {
             ret = amdsvm_vm_api_refresh_map(accel_state, cpu, &guest_map);
             if (ret) {
                 goto out;
             }
         }
+        /* The VM-wide preparation creates only the BSP.  AP contexts are
+         * deliberately lazy, so create and initialize this vCPU after its
+         * QEMU reset/SIPI state is ready and before the run loop publishes
+         * per-vCPU MTRRs or attempts RUN. */
+        if (amdsvm_vm_api_ensure_vcpu(accel_state, cpu) != 0) {
+            error_report("AMD-SVM VM API CPU %d context preparation failed before RUN",
+                         cpu->cpu_index);
+            ret = -EIO;
+            goto out;
+        }
     } else if (accel_state->guest_map_initialized &&
-        memcmp(&guest_map, &accel_state->guest_map,
-               sizeof(guest_map)) != 0) {
+        !amdsvm_memory_map_equal(&guest_map, &accel_state->guest_map)) {
         /*
          * SeaBIOS changes QEMU's FlatView when it enables PCI PAM/ROM shadowing.
          * The current provider ABI pins a complete map once and has no atomic
@@ -2538,9 +3486,11 @@ static int amdsvm_run_qemu_firmware(CPUState *cpu,
                    sizeof(current_mtrr)) != 0) {
             memset(&memory_types, 0, sizeof(memory_types));
             amdvm_vcpu_lifecycle_result_t lifecycle = { 0 };
-            if (!amdsvm_build_memory_type_request(&guest_map, &current_mtrr,
-                                                 AMDVM_GUEST_MTRR_COMPAT_ALL_WB,
-                                                 &memory_types, &err)) {
+            if (!amdsvm_build_published_memory_type_request(
+                    &guest_map, &accel_state->guest_map,
+                    accel_state->vm_api, &current_mtrr,
+                    AMDVM_GUEST_MTRR_COMPAT_ALL_WB,
+                    &memory_types, &err)) {
                 error_report_err(err);
                 ret = -ENOTSUP;
                 goto out;
@@ -2628,13 +3578,106 @@ static int amdsvm_run_qemu_firmware(CPUState *cpu,
         run.kick_generation = accel_state->vm_api ?
             qatomic_read(&accel_state->vm_kick_generation[cpu->cpu_index]) :
             qatomic_read(&accel_state->kick_generation);
-        if (amdsvm_state_load(cpu, &run.state) != 0) {
+        int64_t state_load_started_us = amdsvm_perf_enabled(accel_state) ?
+            g_get_monotonic_time() : 0;
+        int state_load_rc = amdsvm_state_load(cpu, &run.state);
+        if (state_load_started_us) {
+            amdsvm_perf_record_state_load(accel_state, cpu->cpu_index,
+                g_get_monotonic_time() - state_load_started_us);
+        }
+        if (state_load_rc != 0) {
             error_report("AMD-SVM rejected QEMU CPU state before VMRUN");
             ret = -EINVAL;
             goto out;
         }
         amdsvm_prepare_irq_injection(
             cpu, &accel_state->pending_events[cpu->cpu_index], &run);
+        const uint64_t guest_cr0 = run.state.cr[0];
+        const uint64_t cr0_pe_mask = 1ull;
+        const uint64_t rflags_if_mask = 1ull << 9;
+        const bool transition_window =
+            run.state.segments[AMDVM_X86_SEG_CS].selector == 0x50 &&
+            (guest_cr0 & cr0_pe_mask) != 0;
+        const bool external_irq = run.event_injection != 0 &&
+            (run.event_injection & AMDVM_VCPU_EVENTINJ_VALID) != 0 &&
+            (run.event_injection & AMDVM_VCPU_EVENTINJ_TYPE_MASK) ==
+                AMDVM_VCPU_EVENTINJ_TYPE_EXTERNAL;
+        /* Keep bounded firmware and kernel budgets so boot IRQs cannot crowd
+         * out the Windows kernel events this trace is meant to diagnose. */
+        const bool kernel_event_trace =
+            run.state.rip >= UINT64_C(0xfffff80000000000);
+        const bool exception_event = run.event_injection != 0 &&
+            (run.event_injection & AMDVM_VCPU_EVENTINJ_VALID) != 0 &&
+            (run.event_injection & AMDVM_VCPU_EVENTINJ_TYPE_MASK) ==
+                AMDVM_VCPU_EVENTINJ_TYPE_EXCEPTION;
+        const bool kernel_exception_trace = kernel_event_trace &&
+            exception_event &&
+            accel_state->kernel_exception_trace_count[cpu->cpu_index] <
+                AMDSVM_KERNEL_EXCEPTION_TRACE_LIMIT;
+        const bool trace_kernel_event_this_run =
+            accel_state->trace_vmexit && run.event_injection != 0 &&
+            kernel_event_trace &&
+            (accel_state->kernel_event_trace_count[cpu->cpu_index] <
+                 AMDSVM_KERNEL_EVENT_TRACE_LIMIT || kernel_exception_trace);
+        if (accel_state->trace_vmexit && run.event_injection != 0 &&
+            (kernel_event_trace ?
+             trace_kernel_event_this_run :
+             accel_state->transition_event_trace_count[cpu->cpu_index] < 256)) {
+            uint64_t event_index =
+                ++accel_state->transition_event_trace_count[cpu->cpu_index];
+            if (kernel_event_trace &&
+                accel_state->kernel_event_trace_count[cpu->cpu_index] <
+                    AMDSVM_KERNEL_EVENT_TRACE_LIMIT) {
+                ++accel_state->kernel_event_trace_count[cpu->cpu_index];
+            }
+            if (kernel_exception_trace) {
+                ++accel_state->kernel_exception_trace_count[cpu->cpu_index];
+            }
+            error_report("AMDVM_EVENT_INJECTION_DIAG index=%llu vcpu=%d event=0x%x vector=%u type=%u cs=%04x cs_base=0x%016llx ss=%04x ss_attr=0x%04x ss_base=0x%016llx rsp=0x%llx stack_width=%u rip=0x%llx cr0=0x%llx pe=%u if=%u interruptibility=0x%x irq_request=0x%x irq_pending=%u nmi_pending=%u exception_pending=%u",
+                         (unsigned long long)event_index,
+                         cpu->cpu_index, run.event_injection,
+                         run.event_injection & 0xffu,
+                         (run.event_injection &
+                             AMDVM_VCPU_EVENTINJ_TYPE_MASK) >>
+                             AMDVM_VCPU_EVENTINJ_TYPE_SHIFT,
+                         run.state.segments[AMDVM_X86_SEG_CS].selector,
+                         (unsigned long long)run.state.segments[
+                             AMDVM_X86_SEG_CS].base,
+                         run.state.segments[AMDVM_X86_SEG_SS].selector,
+                         run.state.segments[AMDVM_X86_SEG_SS].attributes,
+                         (unsigned long long)run.state.segments[
+                             AMDVM_X86_SEG_SS].base,
+                         (unsigned long long)run.state.gpr[AMDSVM_GPR_RSP],
+                         (run.state.segments[AMDVM_X86_SEG_SS].attributes &
+                          (1u << 10)) ? 32u : 16u,
+                         (unsigned long long)run.state.rip,
+                         (unsigned long long)guest_cr0,
+                         (guest_cr0 & cr0_pe_mask) != 0,
+                         (run.state.rflags & rflags_if_mask) != 0,
+                         run.state.interruptibility,
+                         qatomic_read(&cpu->interrupt_request),
+                         accel_state->pending_events[cpu->cpu_index].irq_pending,
+                         accel_state->pending_events[cpu->cpu_index].nmi_pending,
+                         accel_state->pending_events[cpu->cpu_index].exception_pending);
+        }
+        if (accel_state->diagnostic_transition_irq_gate &&
+            transition_window && external_irq &&
+            !accel_state->pending_events[cpu->cpu_index].exception_pending &&
+            !accel_state->pending_events[cpu->cpu_index].nmi_pending) {
+            uint64_t gate_index =
+                ++accel_state->transition_irq_gate_count[cpu->cpu_index];
+            dispatch_context.defer_external_irq_completion = true;
+            run.event_injection = 0;
+            run.event_injection_error_code = 0;
+            error_report("AMDVM_TRANSITION_IRQ_DEFERRED index=%llu vcpu=%d vector=%u cs=%04x rip=0x%llx cr0=0x%llx if=%u",
+                         (unsigned long long)gate_index,
+                         cpu->cpu_index,
+                         accel_state->pending_events[cpu->cpu_index].irq_vector,
+                         run.state.segments[AMDVM_X86_SEG_CS].selector,
+                         (unsigned long long)run.state.rip,
+                         (unsigned long long)guest_cr0,
+                         (run.state.rflags & rflags_if_mask) != 0);
+        }
         /* cpu_has_work also wakes for APIC polls and host work. Those do not
          * wake architectural HLT. Keep the provider halted until a real
          * guest event has been selected and retained for EVENTINJ. */
@@ -2662,9 +3705,24 @@ static int amdsvm_run_qemu_firmware(CPUState *cpu,
             continue;
         }
         bool trace_this_run = false;
+        bool kernel_gpr_trace_this_run = false;
+        bool transition_trace_this_run = false;
         uint64_t trace_run_index = 0;
         int64_t run_started_wall_us = g_get_real_time();
         int64_t run_started_us = g_get_monotonic_time();
+        transition_trace_this_run = accel_state->trace_vmexit &&
+            amdsvm_is_transition16big_state(&run.state);
+        if (accel_state->diagnostic_cr0_window_trace &&
+            amdsvm_cr0_window_contains(&run.state)) {
+            amdsvm_trace_cr0_window("QEMU_PRE_RUN", cpu->cpu_index,
+                                    &run.state, UINT64_MAX,
+                                    "unavailable_before_RUN");
+        }
+        if (transition_trace_this_run) {
+            amdsvm_trace_transition_state("QEMU_PRE_RUN", cpu->cpu_index,
+                                          &run.state, UINT64_MAX, 0,
+                                          run.event_injection);
+        }
         if (accel_state->trace_vmexit) {
             trace_run_index = qatomic_fetch_inc(
                 &accel_state->trace_run_attempts) + 1;
@@ -2675,6 +3733,13 @@ static int amdsvm_run_qemu_firmware(CPUState *cpu,
                     AMDSVM_VMEXIT_TRACE_INITIAL_LIMIT ||
                 (trace_run_index &
                     AMDSVM_VMEXIT_TRACE_SAMPLE_MASK) == 0;
+            if (run.state.rip >= UINT64_C(0xffffffff80000000) &&
+                accel_state->kernel_gpr_trace_count[cpu->cpu_index] <
+                    AMDSVM_KERNEL_GPR_TRACE_LIMIT) {
+                kernel_gpr_trace_this_run = true;
+                trace_this_run = true;
+                ++accel_state->kernel_gpr_trace_count[cpu->cpu_index];
+            }
             if (trace_this_run) {
                 error_report("AMDVM_FINITE_KICK_ENTRY index=%llu vcpu=%d generation=%llu guest_rip=0x%llx cs=%04x/%016llx cr0=0x%llx rflags=0x%llx halted=%u irq=0x%x started_us=%lld started_wall_us=%lld",
                              (unsigned long long)trace_run_index,
@@ -2700,17 +3765,58 @@ static int amdsvm_run_qemu_firmware(CPUState *cpu,
          * into an unbounded re-entry loop.
          */
         bql_unlock();
+        int64_t provider_started_us = amdsvm_perf_enabled(accel_state) ?
+            g_get_monotonic_time() : 0;
         int provider_status = accel_state->vm_api ?
             amdsvm_vm_api_run_once(accel_state, cpu, &run, &result) :
             amdsvm_provider_run(&accel_state->provider_lifecycle,
                                 &run, &result);
-        bql_lock();
+        int64_t provider_finished_us = provider_started_us ?
+            g_get_monotonic_time() : 0;
+        AMDVMBQLSpinResult bql_spin = { 0 };
+        if (accel_state->bql_spin_enabled) {
+            bql_spin = amdsvm_bql_try_acquire_bounded(
+                AMDSVM_BQL_SPIN_BUDGET, amdsvm_bql_try_acquire,
+                amdsvm_bql_relax, NULL);
+        }
+        if (!bql_spin.acquired) {
+            bql_lock();
+        }
+        if (provider_started_us) {
+            amdsvm_perf_record_run(accel_state, cpu->cpu_index,
+                provider_status < 0 ? UINT64_MAX : result.exit_code,
+                g_get_monotonic_time() - provider_started_us,
+                provider_finished_us - provider_started_us,
+                g_get_monotonic_time() - provider_finished_us,
+                accel_state->bql_spin_enabled ? &bql_spin : NULL,
+                result.exit_info2);
+        }
         if (provider_status < 0) {
             /* An IOKit error can follow a completed hardware entry. */
             vmrun_attempted = true;
             error_report("AMD-SVM QEMU provider RUN call failed");
-            ret = -EIO;
+            ret = provider_status;
             goto out;
+        }
+        if (trace_kernel_event_this_run) {
+            error_report("AMDVM_EVENT_RUN_RESULT vcpu=%d event=0x%x vector=%u type=%u entry_rip=0x%llx entry_rsp=0x%llx entry_rflags=0x%llx entry_interruptibility=0x%llx exit_code=0x%llx exit_rip=0x%llx exit_rsp=0x%llx exit_rflags=0x%llx exit_interruptibility=0x%llx exit_int_info=0x%x flags=0x%x context=%d owner=%d vmrun=%d",
+                         cpu->cpu_index, run.event_injection,
+                         run.event_injection & 0xffu,
+                         (run.event_injection &
+                             AMDVM_VCPU_EVENTINJ_TYPE_MASK) >>
+                             AMDVM_VCPU_EVENTINJ_TYPE_SHIFT,
+                         (unsigned long long)run.state.rip,
+                         (unsigned long long)run.state.gpr[AMDSVM_GPR_RSP],
+                         (unsigned long long)run.state.rflags,
+                         (unsigned long long)run.state.interruptibility,
+                         (unsigned long long)result.exit_code,
+                         (unsigned long long)result.state.rip,
+                         (unsigned long long)result.state.gpr[AMDSVM_GPR_RSP],
+                         (unsigned long long)result.state.rflags,
+                         (unsigned long long)result.state.interruptibility,
+                         result.exit_int_info, result.flags,
+                         result.context_status, result.owner_status,
+                         result.vmrun_status);
         }
         if (result.abi_version == AMDVM_VCPU_ABI_VERSION &&
             result.flags == 0 &&
@@ -2756,28 +3862,160 @@ static int amdsvm_run_qemu_firmware(CPUState *cpu,
             accel_state->provider_halted[cpu->cpu_index] = false;
             preentry_fpu_retry_count = 0;
         }
-        if (trace_this_run) {
+        if (accel_state->diagnostic_cr0_window_trace &&
+            amdsvm_cr0_window_contains(&run.state)) {
+            if (accel_state->vm_api) {
+                error_report("AMDVM_CR0_WINDOW stage=VMCB_ENTRY vcpu=%d rip=0x%llx qemu_cr0=0x%llx qemu_pe=%u vmcb_cr0=unavailable vmcb_pe=unavailable reason=VM_API_RUN_result_has_no_entry_snapshot",
+                             cpu->cpu_index,
+                             (unsigned long long)run.state.rip,
+                             (unsigned long long)run.state.cr[0],
+                             (unsigned)(run.state.cr[0] & 1u));
+            } else {
+                error_report("AMDVM_CR0_WINDOW stage=VMCB_ENTRY vcpu=%d rip=0x%llx qemu_cr0=0x%llx qemu_pe=%u vmcb_cr0=0x%llx vmcb_pe=%u",
+                             cpu->cpu_index,
+                             (unsigned long long)run.state.rip,
+                             (unsigned long long)run.state.cr[0],
+                             (unsigned)(run.state.cr[0] & 1u),
+                             (unsigned long long)result.entry.cr0,
+                             (unsigned)(result.entry.cr0 & 1u));
+            }
+        }
+        {
+            static unsigned waitloop_exit_logs;
+            if (waitloop_exit_logs < 64 &&
+                ((run.state.rip >= 0x41b000 && run.state.rip < 0x41c000) ||
+                 (result.state.rip >= 0x41b000 &&
+                  result.state.rip < 0x41c000))) {
+                error_report("AMDVM_WAITLOOP entry_rip=0x%llx exit_rip=0x%llx "
+                             "next_rip=0x%llx exit=0x%llx info1=0x%llx "
+                             "info2=0x%llx int_info=0x%x vmrun=%d context=%d "
+                             "owner=%d entry_cr0=0x%llx exit_cr0=0x%llx "
+                             "entry_eventinj=0x%llx exit_eventinj=0x%llx "
+                             "rsp=0x%llx rax=0x%llx rdx=0x%llx",
+                             (unsigned long long)run.state.rip,
+                             (unsigned long long)result.state.rip,
+                             (unsigned long long)result.next_rip,
+                             (unsigned long long)result.exit_code,
+                             (unsigned long long)result.exit_info1,
+                             (unsigned long long)result.exit_info2,
+                             result.exit_int_info, result.vmrun_status,
+                             result.context_status, result.owner_status,
+                             (unsigned long long)run.state.cr[0],
+                             (unsigned long long)result.state.cr[0],
+                             (unsigned long long)run.event_injection,
+                             (unsigned long long)result.entry.event_injection,
+                             (unsigned long long)run.state.gpr[AMDSVM_GPR_RSP],
+                             (unsigned long long)result.state.gpr[AMDSVM_GPR_RAX],
+                             (unsigned long long)result.state.gpr[AMDSVM_GPR_RDX]);
+                waitloop_exit_logs++;
+            }
+        }
+        if (accel_state->diagnostic_cr0_window_trace &&
+            amdsvm_cr0_window_contains(&result.state)) {
+            amdsvm_trace_cr0_window("VMCB_EXIT", cpu->cpu_index,
+                                    &result.state, result.exit_code,
+                                    accel_state->vm_api ? "unavailable" :
+                                                         "available");
+        }
+        transition_trace_this_run |=
+            amdsvm_is_transition16big_state(&result.state) ||
+            ((run.state.cr[0] ^ result.state.cr[0]) & 1u) != 0;
+        if (accel_state->trace_vmexit && transition_trace_this_run) {
+            const amdvm_x86_segment_state_t *qemu_cs =
+                &run.state.segments[AMDVM_X86_SEG_CS];
+            if (!amdsvm_is_transition16big_state(&run.state)) {
+                amdsvm_trace_transition_state("QEMU_PRE_RUN", cpu->cpu_index,
+                                              &run.state, UINT64_MAX, 0,
+                                              run.event_injection);
+            }
+            if (accel_state->vm_api) {
+                error_report("AMDVM_TRANSITION_VMCB_ENTRY_UNAVAILABLE vcpu=%d reason=VM_API_RUN_result_has_no_entry_snapshot qemu_cs=%04x/%04x:%08x:0x%016llx qemu_rip=0x%llx qemu_cr0=0x%llx qemu_eventinj=0x%x",
+                             cpu->cpu_index,
+                             qemu_cs->selector, qemu_cs->attributes,
+                             qemu_cs->limit,
+                             (unsigned long long)qemu_cs->base,
+                             (unsigned long long)run.state.rip,
+                             (unsigned long long)run.state.cr[0],
+                             run.event_injection);
+            } else {
+                uint32_t vmcb_mismatch = 0;
+
+                if (qemu_cs->selector != result.entry.cs_selector) vmcb_mismatch |= 1u << 0;
+                if (qemu_cs->attributes != result.entry.cs_attributes) vmcb_mismatch |= 1u << 1;
+                if (qemu_cs->limit != result.entry.cs_limit) vmcb_mismatch |= 1u << 2;
+                if (qemu_cs->base != result.entry.cs_base) vmcb_mismatch |= 1u << 3;
+                if (run.state.rip != result.entry.rip) vmcb_mismatch |= 1u << 4;
+                if (run.state.rflags != result.entry.rflags) vmcb_mismatch |= 1u << 5;
+                if (run.state.cr[0] != result.entry.cr0) vmcb_mismatch |= 1u << 6;
+                if (run.event_injection != result.entry.event_injection) vmcb_mismatch |= 1u << 7;
+                error_report("AMDVM_TRANSITION_QEMU_VMCB_ENTRY vcpu=%d mismatch=0x%x qemu_cs=%04x/%04x:%08x:0x%016llx vmcb_cs=%04x/%04x:%08x:0x%016llx qemu_rip=0x%llx vmcb_rip=0x%llx qemu_cr0=0x%llx vmcb_cr0=0x%llx qemu_eventinj=0x%x vmcb_eventinj=0x%llx vmcb_exit_int_info_before=0x%x",
+                             cpu->cpu_index, vmcb_mismatch,
+                             qemu_cs->selector, qemu_cs->attributes,
+                             qemu_cs->limit,
+                             (unsigned long long)qemu_cs->base,
+                             result.entry.cs_selector, result.entry.cs_attributes,
+                             result.entry.cs_limit,
+                             (unsigned long long)result.entry.cs_base,
+                             (unsigned long long)run.state.rip,
+                             (unsigned long long)result.entry.rip,
+                             (unsigned long long)run.state.cr[0],
+                             (unsigned long long)result.entry.cr0,
+                             run.event_injection,
+                             (unsigned long long)result.entry.event_injection,
+                             result.exit_int_info);
+            }
+            amdsvm_trace_transition_state("VMCB_EXIT", cpu->cpu_index,
+                                          &result.state, result.exit_code,
+                                          result.exit_int_info,
+                                          accel_state->vm_api ? UINT64_MAX :
+                                          result.entry.event_injection);
+        }
+        /* Always capture a first intercepted #GP, even when VMEXIT tracing
+         * has moved past its sampled RUN window. The stack and caller bytes
+         * are needed to diagnose the fault and are only read from guest RAM.
+         */
+        if (trace_this_run || result.exit_code == 0x4d) {
             int64_t run_completed_us = g_get_monotonic_time();
             int64_t run_completed_wall_us = g_get_real_time();
-            error_report("AMDVM_FINITE_KICK_VMEXIT code=0x%llx vcpu=%d rip=0x%llx next_rip=0x%llx info1=0x%llx info2=0x%llx flags=0x%x abi=%u context=%d owner=%d vmrun=%d exit_int_info=0x%x entry_flags=0x%x entry_sentinel=0x%llx generation=%llu started_us=%lld completed_us=%lld run_elapsed_us=%lld started_wall_us=%lld completed_wall_us=%lld",
-                         (unsigned long long)result.exit_code,
-                         cpu->cpu_index,
-                         (unsigned long long)result.state.rip,
-                         (unsigned long long)result.next_rip,
-                         (unsigned long long)result.exit_info1,
-                         (unsigned long long)result.exit_info2,
-                         result.flags,
-                         result.abi_version, result.context_status,
-                         result.owner_status, result.vmrun_status,
-                         result.exit_int_info, result.entry.flags,
-                         (unsigned long long)result.entry.exit_code_sentinel,
-                         (unsigned long long)run.kick_generation,
-                         (long long)run_started_us,
-                         (long long)run_completed_us,
-                         (long long)(run_completed_us - run_started_us),
-                         (long long)run_started_wall_us,
-                         (long long)run_completed_wall_us);
-            if (result.exit_code != SVM_EXIT_INTR) {
+            if (accel_state->vm_api) {
+                error_report("AMDVM_FINITE_KICK_VMEXIT code=0x%llx vcpu=%d rip=0x%llx next_rip=0x%llx info1=0x%llx info2=0x%llx flags=0x%x abi=%u context=%d owner=%d vmrun=%d exit_int_info=0x%x entry_snapshot=unavailable generation=%llu started_us=%lld completed_us=%lld run_elapsed_us=%lld started_wall_us=%lld completed_wall_us=%lld",
+                             (unsigned long long)result.exit_code,
+                             cpu->cpu_index,
+                             (unsigned long long)result.state.rip,
+                             (unsigned long long)result.next_rip,
+                             (unsigned long long)result.exit_info1,
+                             (unsigned long long)result.exit_info2,
+                             result.flags,
+                             result.abi_version, result.context_status,
+                             result.owner_status, result.vmrun_status,
+                             result.exit_int_info,
+                             (unsigned long long)run.kick_generation,
+                             (long long)run_started_us,
+                             (long long)run_completed_us,
+                             (long long)(run_completed_us - run_started_us),
+                             (long long)run_started_wall_us,
+                             (long long)run_completed_wall_us);
+            } else {
+                error_report("AMDVM_FINITE_KICK_VMEXIT code=0x%llx vcpu=%d rip=0x%llx next_rip=0x%llx info1=0x%llx info2=0x%llx flags=0x%x abi=%u context=%d owner=%d vmrun=%d exit_int_info=0x%x entry_flags=0x%x entry_sentinel=0x%llx generation=%llu started_us=%lld completed_us=%lld run_elapsed_us=%lld started_wall_us=%lld completed_wall_us=%lld",
+                             (unsigned long long)result.exit_code,
+                             cpu->cpu_index,
+                             (unsigned long long)result.state.rip,
+                             (unsigned long long)result.next_rip,
+                             (unsigned long long)result.exit_info1,
+                             (unsigned long long)result.exit_info2,
+                             result.flags,
+                             result.abi_version, result.context_status,
+                             result.owner_status, result.vmrun_status,
+                             result.exit_int_info, result.entry.flags,
+                             (unsigned long long)result.entry.exit_code_sentinel,
+                             (unsigned long long)run.kick_generation,
+                             (long long)run_started_us,
+                             (long long)run_completed_us,
+                             (long long)(run_completed_us - run_started_us),
+                             (long long)run_started_wall_us,
+                             (long long)run_completed_wall_us);
+            }
+            if (trace_this_run && result.exit_code != SVM_EXIT_INTR) {
                 uint8_t code_bytes[16] = { 0 };
                 uint8_t stack_bytes[16] = { 0 };
                 uint8_t return_bytes[16] = { 0 };
@@ -2852,7 +4090,69 @@ static int amdsvm_run_qemu_firmware(CPUState *cpu,
                              return_bytes[10], return_bytes[11], return_bytes[12],
                              return_bytes[13], return_bytes[14], return_bytes[15]);
             }
-            if (result.exit_code != SVM_EXIT_INTR) {
+            if (kernel_gpr_trace_this_run) {
+                error_report("AMDVM_KERNEL_GPR_STATE index=%llu vcpu=%d eventinj=0x%x exit_code=0x%llx exit_int_info=0x%x entry_rip=0x%llx entry_rax=0x%llx entry_rbx=0x%llx entry_rcx=0x%llx entry_rdx=0x%llx entry_rsi=0x%llx entry_rdi=0x%llx entry_rbp=0x%llx entry_rsp=0x%llx entry_r8=0x%llx entry_r9=0x%llx entry_r10=0x%llx entry_r11=0x%llx entry_r12=0x%llx entry_r13=0x%llx entry_r14=0x%llx entry_r15=0x%llx exit_rip=0x%llx exit_rax=0x%llx exit_rbx=0x%llx exit_rcx=0x%llx exit_rdx=0x%llx exit_rsi=0x%llx exit_rdi=0x%llx exit_rbp=0x%llx exit_rsp=0x%llx exit_r8=0x%llx exit_r9=0x%llx exit_r10=0x%llx exit_r11=0x%llx exit_r12=0x%llx exit_r13=0x%llx exit_r14=0x%llx exit_r15=0x%llx cr0=0x%llx cr2=0x%llx cr3=0x%llx cr4=0x%llx",
+                             (unsigned long long)accel_state->kernel_gpr_trace_count[cpu->cpu_index],
+                             cpu->cpu_index, run.event_injection,
+                             (unsigned long long)result.exit_code,
+                             result.exit_int_info,
+                             (unsigned long long)run.state.rip,
+                             (unsigned long long)run.state.gpr[AMDSVM_GPR_RAX],
+                             (unsigned long long)run.state.gpr[AMDSVM_GPR_RBX],
+                             (unsigned long long)run.state.gpr[AMDSVM_GPR_RCX],
+                             (unsigned long long)run.state.gpr[AMDSVM_GPR_RDX],
+                             (unsigned long long)run.state.gpr[AMDSVM_GPR_RSI],
+                             (unsigned long long)run.state.gpr[AMDSVM_GPR_RDI],
+                             (unsigned long long)run.state.gpr[AMDSVM_GPR_RBP],
+                             (unsigned long long)run.state.gpr[AMDSVM_GPR_RSP],
+                             (unsigned long long)run.state.gpr[AMDSVM_GPR_R8],
+                             (unsigned long long)run.state.gpr[AMDSVM_GPR_R9],
+                             (unsigned long long)run.state.gpr[AMDSVM_GPR_R10],
+                             (unsigned long long)run.state.gpr[AMDSVM_GPR_R11],
+                             (unsigned long long)run.state.gpr[AMDSVM_GPR_R12],
+                             (unsigned long long)run.state.gpr[AMDSVM_GPR_R13],
+                             (unsigned long long)run.state.gpr[AMDSVM_GPR_R14],
+                             (unsigned long long)run.state.gpr[AMDSVM_GPR_R15],
+                             (unsigned long long)result.state.rip,
+                             (unsigned long long)result.state.gpr[AMDSVM_GPR_RAX],
+                             (unsigned long long)result.state.gpr[AMDSVM_GPR_RBX],
+                             (unsigned long long)result.state.gpr[AMDSVM_GPR_RCX],
+                             (unsigned long long)result.state.gpr[AMDSVM_GPR_RDX],
+                             (unsigned long long)result.state.gpr[AMDSVM_GPR_RSI],
+                             (unsigned long long)result.state.gpr[AMDSVM_GPR_RDI],
+                             (unsigned long long)result.state.gpr[AMDSVM_GPR_RBP],
+                             (unsigned long long)result.state.gpr[AMDSVM_GPR_RSP],
+                             (unsigned long long)result.state.gpr[AMDSVM_GPR_R8],
+                             (unsigned long long)result.state.gpr[AMDSVM_GPR_R9],
+                             (unsigned long long)result.state.gpr[AMDSVM_GPR_R10],
+                             (unsigned long long)result.state.gpr[AMDSVM_GPR_R11],
+                             (unsigned long long)result.state.gpr[AMDSVM_GPR_R12],
+                             (unsigned long long)result.state.gpr[AMDSVM_GPR_R13],
+                             (unsigned long long)result.state.gpr[AMDSVM_GPR_R14],
+                             (unsigned long long)result.state.gpr[AMDSVM_GPR_R15],
+                             (unsigned long long)result.state.cr[0],
+                             (unsigned long long)result.state.cr[2],
+                             (unsigned long long)result.state.cr[3],
+                             (unsigned long long)result.state.cr[4]);
+            }
+            if (trace_this_run && result.exit_code != SVM_EXIT_INTR) {
+                if (accel_state->vm_api) {
+                    error_report("AMDVM_EXIT_DIAG code=0x%llx exit_rip=0x%llx nrip=0x%llx info1=0x%llx info2=0x%llx exit_int_info=0x%x decode_len=%u decode=%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x entry_snapshot=unavailable",
+                                 (unsigned long long)result.exit_code,
+                                 (unsigned long long)result.state.rip,
+                                 (unsigned long long)result.next_rip,
+                                 (unsigned long long)result.exit_info1,
+                                 (unsigned long long)result.exit_info2,
+                                 result.exit_int_info, result.instruction_length,
+                                 result.instruction_bytes[0], result.instruction_bytes[1],
+                                 result.instruction_bytes[2], result.instruction_bytes[3],
+                                 result.instruction_bytes[4], result.instruction_bytes[5],
+                                 result.instruction_bytes[6], result.instruction_bytes[7],
+                                 result.instruction_bytes[8], result.instruction_bytes[9],
+                                 result.instruction_bytes[10], result.instruction_bytes[11],
+                                 result.instruction_bytes[12], result.instruction_bytes[13],
+                                 result.instruction_bytes[14]);
+                } else {
                 error_report("AMDVM_EXIT_DIAG code=0x%llx exit_rip=0x%llx nrip=0x%llx info1=0x%llx info2=0x%llx exit_int_info=0x%x decode_len=%u decode=%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x entry_gpa=0x%llx entry_hpa=0x%llx entry_bytes=%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x entry_rip=0x%llx cs=%04x/%04x:%08x:0x%llx cr0=0x%llx cr3=0x%llx cr4=0x%llx efer=0x%llx npt=%u n_cr3=0x%llx asid=%u intercept1=0x%x intercept2=0x%x eventinj=0x%llx",
                              (unsigned long long)result.exit_code,
                              (unsigned long long)result.state.rip,
@@ -2891,6 +4191,7 @@ static int amdsvm_run_qemu_firmware(CPUState *cpu,
                              result.entry.asid, result.entry.intercept_misc1,
                              result.entry.intercept_misc2,
                              (unsigned long long)result.entry.event_injection);
+                }
             }
             if (result.exit_code == SVM_EXIT_INTR) {
                 uint8_t intr_code[16] = { 0 };
@@ -2908,10 +4209,12 @@ static int amdsvm_run_qemu_firmware(CPUState *cpu,
                             sizeof(intr_code));
                     }
                 }
-                error_report("AMDVM_PHYSICAL_INTR_STATE vcpu=%d rip=0x%llx rflags=0x%llx cs=%04x/%04x:%08x:0x%llx ss=%04x/%04x:%08x:0x%llx code_status=0x%x code=%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x irq_before_events=0x%x halted=%u",
+                error_report("AMDVM_PHYSICAL_INTR_STATE vcpu=%d rip=0x%llx rflags=0x%llx cr0=0x%llx pe=%u cs=%04x/%04x:%08x:0x%llx ss=%04x/%04x:%08x:0x%llx code_status=0x%x code=%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x irq_before_events=0x%x halted=%u",
                              cpu->cpu_index,
                              (unsigned long long)result.state.rip,
                              (unsigned long long)result.state.rflags,
+                             (unsigned long long)result.state.cr[0],
+                             (result.state.cr[0] & 1u) != 0,
                              result.state.segments[AMDVM_X86_SEG_CS].selector,
                              result.state.segments[AMDVM_X86_SEG_CS].attributes,
                              result.state.segments[AMDVM_X86_SEG_CS].limit,
@@ -2931,15 +4234,28 @@ static int amdsvm_run_qemu_firmware(CPUState *cpu,
             if (result.exit_code == 0x4d) {
                 uint8_t fault_bytes[16] = { 0 };
                 uint8_t stack_bytes[16] = { 0 };
+                uint8_t frame_bytes[8] = { 0 };
                 const uint64_t fault_offset = result.state.rip;
                 const uint64_t cs_base = result.state.segments[AMDVM_X86_SEG_CS].base;
                 const uint64_t stack_pointer = result.state.gpr[AMDSVM_GPR_RSP];
+                const uint64_t frame_pointer = result.state.gpr[AMDSVM_GPR_RBP];
                 const uint64_t ss_base = result.state.segments[AMDVM_X86_SEG_SS].base;
+                const amdvm_x86_segment_state_t *ss =
+                    &result.state.segments[AMDVM_X86_SEG_SS];
                 const uint64_t cr0 = result.state.cr[0];
+                const uint64_t efer = result.state.efer;
+                const bool long_mode = (efer & (1ull << 10)) != 0;
+                const bool stack32 = (ss->attributes & (1u << 10)) != 0;
+                const uint64_t stack_mask = long_mode ? UINT64_MAX :
+                    (stack32 ? UINT32_MAX : UINT16_MAX);
+                const uint64_t effective_sp = stack_pointer & stack_mask;
+                const uint64_t effective_bp = frame_pointer & stack_mask;
                 uint64_t fault_linear = 0;
                 uint64_t stack_linear = 0;
+                uint64_t frame_linear = 0;
                 MemTxResult read_status = MEMTX_ERROR;
                 MemTxResult stack_status = MEMTX_ERROR;
+                MemTxResult frame_status = MEMTX_ERROR;
                 if (fault_offset <= UINT64_MAX - cs_base) {
                     fault_linear = cs_base + fault_offset;
                     if ((cr0 & (1ull << 31)) == 0) {
@@ -2948,12 +4264,28 @@ static int amdsvm_run_qemu_firmware(CPUState *cpu,
                             fault_bytes, sizeof(fault_bytes));
                     }
                 }
-                if (stack_pointer <= UINT64_MAX - ss_base) {
-                    stack_linear = ss_base + stack_pointer;
-                    if ((cr0 & (1ull << 31)) == 0) {
+                if (effective_sp <= UINT64_MAX - ss_base) {
+                    stack_linear = ss_base + effective_sp;
+                    if ((cr0 & (1ull << 31)) == 0 &&
+                        (long_mode || effective_sp <= ss->limit)) {
+                        size_t stack_read_len = sizeof(stack_bytes);
+                        if (!long_mode && stack_read_len - 1 >
+                            ss->limit - effective_sp) {
+                            stack_read_len = ss->limit - effective_sp + 1;
+                        }
                         stack_status = address_space_read(&address_space_memory,
                             stack_linear, MEMTXATTRS_UNSPECIFIED,
-                            stack_bytes, sizeof(stack_bytes));
+                            stack_bytes, stack_read_len);
+                    }
+                }
+                if (effective_bp <= UINT64_MAX - ss_base - 2) {
+                    frame_linear = ss_base + effective_bp + 2;
+                    if ((cr0 & (1ull << 31)) == 0 &&
+                        (long_mode || effective_bp <= ss->limit) &&
+                        (long_mode || ss->limit - effective_bp >= 5)) {
+                        frame_status = address_space_read(&address_space_memory,
+                            frame_linear, MEMTXATTRS_UNSPECIFIED,
+                            frame_bytes, sizeof(frame_bytes));
                     }
                 }
                 error_report("AMDVM_GP_DIAG rip=0x%llx cs_base=0x%llx linear=0x%llx cr0=0x%llx read_status=0x%x bytes=%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x",
@@ -2980,6 +4312,24 @@ static int amdsvm_run_qemu_firmware(CPUState *cpu,
                              stack_bytes[9], stack_bytes[10], stack_bytes[11],
                              stack_bytes[12], stack_bytes[13], stack_bytes[14],
                              stack_bytes[15]);
+                error_report("AMDVM_GP_STACK_EFFECTIVE raw_rsp=0x%llx effective_sp=0x%llx stack_bits=%u ss=%04x/%04x:%08x:0x%llx linear=0x%llx read_status=0x%x bytes=%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x raw_rbp=0x%llx effective_bp=0x%llx return_slot=0x%llx frame_status=0x%x return_bytes=%02x:%02x:%02x:%02x",
+                             (unsigned long long)stack_pointer,
+                             (unsigned long long)effective_sp,
+                             long_mode ? 64u : (stack32 ? 32u : 16u),
+                             ss->selector, ss->attributes, ss->limit,
+                             (unsigned long long)ss_base,
+                             (unsigned long long)stack_linear, stack_status,
+                             stack_bytes[0], stack_bytes[1], stack_bytes[2],
+                             stack_bytes[3], stack_bytes[4], stack_bytes[5],
+                             stack_bytes[6], stack_bytes[7], stack_bytes[8],
+                             stack_bytes[9], stack_bytes[10], stack_bytes[11],
+                             stack_bytes[12], stack_bytes[13], stack_bytes[14],
+                             stack_bytes[15],
+                             (unsigned long long)frame_pointer,
+                             (unsigned long long)effective_bp,
+                             (unsigned long long)frame_linear, frame_status,
+                             frame_bytes[0], frame_bytes[1], frame_bytes[2],
+                             frame_bytes[3]);
             }
         }
         /*
@@ -2988,9 +4338,564 @@ static int amdsvm_run_qemu_firmware(CPUState *cpu,
          * this path, then let the production dispatcher validate the result.
          */
         vmrun_attempted = true;
-        switch (amdsvm_dispatch_firmware_exit(&run, &result, &dispatch_ops,
-                                               &dispatch_context)) {
+        if (result.exit_code == 0x4d) {
+            const amdvm_x86_segment_state_t *cs =
+                &result.state.segments[AMDVM_X86_SEG_CS];
+            const amdvm_x86_segment_state_t *ss =
+                &result.state.segments[AMDVM_X86_SEG_SS];
+            const amdvm_x86_segment_state_t *ds =
+                &result.state.segments[AMDVM_X86_SEG_DS];
+            const amdvm_x86_segment_state_t *es =
+                &result.state.segments[AMDVM_X86_SEG_ES];
+            uint8_t instruction[16] = { 0 };
+            uint64_t linear = 0;
+            MemTxResult instruction_status = MEMTX_ERROR;
+
+            if (!(result.state.cr[0] & (1ull << 31)) &&
+                result.state.rip <= UINT64_MAX - cs->base) {
+                linear = cs->base + result.state.rip;
+                instruction_status = address_space_read(
+                    &address_space_memory, linear, MEMTXATTRS_UNSPECIFIED,
+                    instruction, sizeof(instruction));
+            }
+            error_report("AMDVM_FIRST_GP_STATE vcpu=%d rip=0x%llx next_rip=0x%llx error=0x%llx info2=0x%llx rflags=0x%llx interruptibility=0x%x cs=%04x/%04x:%08x:0x%llx ds=%04x/%04x:%08x:0x%llx es=%04x/%04x:%08x:0x%llx ss=%04x/%04x:%08x:0x%llx gdtr=%08x:0x%llx idtr=%08x:0x%llx cr0=0x%llx cr2=0x%llx cr3=0x%llx cr4=0x%llx efer=0x%llx rax=0x%llx rcx=0x%llx rdx=0x%llx rbx=0x%llx rsp=0x%llx rbp=0x%llx rsi=0x%llx rdi=0x%llx instruction_status=%d instruction=%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x",
+                         cpu->cpu_index,
+                         (unsigned long long)result.state.rip,
+                         (unsigned long long)result.next_rip,
+                         (unsigned long long)result.exit_info1,
+                         (unsigned long long)result.exit_info2,
+                         (unsigned long long)result.state.rflags,
+                         result.state.interruptibility,
+                         cs->selector, cs->attributes, cs->limit,
+                         (unsigned long long)cs->base,
+                         ds->selector, ds->attributes, ds->limit,
+                         (unsigned long long)ds->base,
+                         es->selector, es->attributes, es->limit,
+                         (unsigned long long)es->base,
+                         ss->selector, ss->attributes, ss->limit,
+                         (unsigned long long)ss->base,
+                         result.state.segments[AMDVM_X86_SEG_GDTR].limit,
+                         (unsigned long long)result.state.segments[
+                             AMDVM_X86_SEG_GDTR].base,
+                         result.state.segments[AMDVM_X86_SEG_IDTR].limit,
+                         (unsigned long long)result.state.segments[
+                             AMDVM_X86_SEG_IDTR].base,
+                         (unsigned long long)result.state.cr[0],
+                         (unsigned long long)result.state.cr[2],
+                         (unsigned long long)result.state.cr[3],
+                         (unsigned long long)result.state.cr[4],
+                         (unsigned long long)result.state.efer,
+                         (unsigned long long)result.state.gpr[AMDSVM_GPR_RAX],
+                         (unsigned long long)result.state.gpr[AMDSVM_GPR_RCX],
+                         (unsigned long long)result.state.gpr[AMDSVM_GPR_RDX],
+                         (unsigned long long)result.state.gpr[AMDSVM_GPR_RBX],
+                         (unsigned long long)result.state.gpr[AMDSVM_GPR_RSP],
+                         (unsigned long long)result.state.gpr[AMDSVM_GPR_RBP],
+                         (unsigned long long)result.state.gpr[AMDSVM_GPR_RSI],
+                         (unsigned long long)result.state.gpr[AMDSVM_GPR_RDI],
+                         instruction_status,
+                         instruction[0], instruction[1], instruction[2],
+                         instruction[3], instruction[4], instruction[5],
+                         instruction[6], instruction[7], instruction[8],
+                         instruction[9], instruction[10], instruction[11],
+                         instruction[12], instruction[13], instruction[14],
+                         instruction[15]);
+        }
+        /*
+         * SVM_EXIT_SHUTDOWN is the architectural triple-fault exit. KVM
+         * treats the same guest condition as a guest reset; do not pass it
+         * through the firmware instruction dispatcher as malformed data.
+         * EXITINTINFO is retained for diagnosis (often the #DF being
+         * delivered when the guest reached shutdown).
+         */
+        if (result.exit_code == SVM_EXIT_SHUTDOWN) {
+            uint8_t guest_code[16] = { 0 };
+            uint8_t idt_df[8] = { 0 };
+            uint8_t idt_gp[8] = { 0 };
+            uint8_t idt_pf[8] = { 0 };
+            uint8_t df_handler[16] = { 0 };
+            uint8_t gp_handler[16] = { 0 };
+            uint8_t gdt_cs[8] = { 0 };
+            uint8_t gdt_ss[8] = { 0 };
+            char guest_code_hex[48], idt_df_hex[24], idt_gp_hex[24];
+            char idt_pf_hex[24], gdt_cs_hex[24], gdt_ss_hex[24];
+            char df_handler_hex[48], gp_handler_hex[48];
+            const amdvm_x86_segment_state_t *cs =
+                &result.state.segments[AMDVM_X86_SEG_CS];
+            const amdvm_x86_segment_state_t *ss =
+                &result.state.segments[AMDVM_X86_SEG_SS];
+            const amdvm_x86_segment_state_t *gdtr =
+                &result.state.segments[AMDVM_X86_SEG_GDTR];
+            const amdvm_x86_segment_state_t *idtr =
+                &result.state.segments[AMDVM_X86_SEG_IDTR];
+            uint64_t linear;
+            MemTxResult code_status = MEMTX_ERROR;
+            MemTxResult idt_df_status = MEMTX_ERROR;
+            MemTxResult idt_gp_status = MEMTX_ERROR;
+            MemTxResult idt_pf_status = MEMTX_ERROR;
+            MemTxResult gdt_cs_status = MEMTX_ERROR;
+            MemTxResult gdt_ss_status = MEMTX_ERROR;
+            MemTxResult df_handler_status = MEMTX_ERROR;
+            MemTxResult gp_handler_status = MEMTX_ERROR;
+            uint16_t df_selector = 0, gp_selector = 0;
+            uint32_t df_offset = 0, gp_offset = 0;
+            uint8_t guest_virtual_code[16] = { 0 };
+            uint8_t guest_virtual_idt_df[16] = { 0 };
+            uint8_t guest_virtual_cr2[16] = { 0 };
+            uint8_t guest_virtual_stack[32] = { 0 };
+            uint8_t guest_virtual_df_handler[16] = { 0 };
+            AMDVMGuestPageWalk code_walk = { 0 }, idt_walk = { 0 };
+            AMDVMGuestPageWalk cr2_walk = { 0 }, stack_walk = { 0 };
+            AMDVMGuestPageWalk handler_walk = { 0 };
+            int guest_virtual_code_status = -3;
+            int guest_virtual_idt_status = -3;
+            int guest_virtual_cr2_status = -3;
+            int guest_virtual_stack_status = -3;
+            int guest_virtual_handler_status = -3;
+            uint64_t guest_virtual_code_address = 0;
+            uint64_t guest_virtual_idt_address = 0;
+            uint64_t guest_virtual_stack_address = 0;
+            uint64_t guest_virtual_handler_address = 0;
+
+            /* With paging off, the firmware's linear descriptor bases are GPA. */
+            if (!(result.state.cr[0] & (1ull << 31)) &&
+                result.state.rip <= UINT64_MAX - cs->base) {
+                linear = cs->base + result.state.rip;
+                code_status = address_space_read(&address_space_memory,
+                    linear, MEMTXATTRS_UNSPECIFIED, guest_code,
+                    sizeof(guest_code));
+                if (idtr->limit >= 8u * 8u + sizeof(idt_df) - 1) {
+                    idt_df_status = address_space_read(&address_space_memory,
+                        idtr->base + 8u * 8u, MEMTXATTRS_UNSPECIFIED,
+                        idt_df, sizeof(idt_df));
+                }
+                if (idtr->limit >= 13u * 8u + sizeof(idt_gp) - 1) {
+                    idt_gp_status = address_space_read(&address_space_memory,
+                        idtr->base + 13u * 8u, MEMTXATTRS_UNSPECIFIED,
+                        idt_gp, sizeof(idt_gp));
+                }
+                if (idtr->limit >= 14u * 8u + sizeof(idt_pf) - 1) {
+                    idt_pf_status = address_space_read(&address_space_memory,
+                        idtr->base + 14u * 8u, MEMTXATTRS_UNSPECIFIED,
+                        idt_pf, sizeof(idt_pf));
+                }
+                if (idt_df_status == MEMTX_OK) {
+                    df_selector = (uint16_t)idt_df[2] |
+                        ((uint16_t)idt_df[3] << 8);
+                    df_offset = (uint32_t)idt_df[0] |
+                        ((uint32_t)idt_df[1] << 8) |
+                        ((uint32_t)idt_df[6] << 16) |
+                        ((uint32_t)idt_df[7] << 24);
+                    if (df_selector == cs->selector &&
+                        df_offset <= cs->limit) {
+                        df_handler_status = address_space_read(
+                            &address_space_memory, cs->base + df_offset,
+                            MEMTXATTRS_UNSPECIFIED, df_handler,
+                            sizeof(df_handler));
+                    }
+                }
+                if (idt_gp_status == MEMTX_OK) {
+                    gp_selector = (uint16_t)idt_gp[2] |
+                        ((uint16_t)idt_gp[3] << 8);
+                    gp_offset = (uint32_t)idt_gp[0] |
+                        ((uint32_t)idt_gp[1] << 8) |
+                        ((uint32_t)idt_gp[6] << 16) |
+                        ((uint32_t)idt_gp[7] << 24);
+                    if (gp_selector == cs->selector &&
+                        gp_offset <= cs->limit) {
+                        gp_handler_status = address_space_read(
+                            &address_space_memory, cs->base + gp_offset,
+                            MEMTXATTRS_UNSPECIFIED, gp_handler,
+                            sizeof(gp_handler));
+                    }
+                }
+                linear = cs->selector & ~7u;
+                if (linear <= gdtr->limit && sizeof(gdt_cs) - 1 <=
+                        gdtr->limit - linear) {
+                    gdt_cs_status = address_space_read(&address_space_memory,
+                        gdtr->base + linear, MEMTXATTRS_UNSPECIFIED,
+                        gdt_cs, sizeof(gdt_cs));
+                }
+                linear = ss->selector & ~7u;
+                if (linear <= gdtr->limit && sizeof(gdt_ss) - 1 <=
+                        gdtr->limit - linear) {
+                    gdt_ss_status = address_space_read(&address_space_memory,
+                        gdtr->base + linear, MEMTXATTRS_UNSPECIFIED,
+                        gdt_ss, sizeof(gdt_ss));
+                }
+            }
+            if (result.state.cr[0] & (UINT64_C(1) << 31)) {
+                /* The original physical dump below deliberately skips these
+                 * reads while paging is enabled. Resolve the fault addresses
+                 * using the CR3 from this exact VMCB exit instead. */
+                if (result.state.rip <= UINT64_MAX - cs->base) {
+                    guest_virtual_code_address = cs->base + result.state.rip;
+                    guest_virtual_code_status =
+                        amdsvm_debug_guest_virtual_read(result.state.cr[3],
+                            result.state.cr[4], guest_virtual_code_address,
+                            guest_virtual_code, sizeof(guest_virtual_code),
+                            &code_walk);
+                }
+                if (idtr->base <= UINT64_MAX - 8u * 16u) {
+                    guest_virtual_idt_address = idtr->base + 8u * 16u;
+                    guest_virtual_idt_status =
+                        amdsvm_debug_guest_virtual_read(result.state.cr[3],
+                            result.state.cr[4], guest_virtual_idt_address,
+                            guest_virtual_idt_df,
+                            sizeof(guest_virtual_idt_df), &idt_walk);
+                }
+                guest_virtual_cr2_status =
+                    amdsvm_debug_guest_virtual_read(result.state.cr[3],
+                        result.state.cr[4], result.state.cr[2],
+                        guest_virtual_cr2, sizeof(guest_virtual_cr2),
+                        &cr2_walk);
+                guest_virtual_stack_address =
+                    result.state.gpr[AMDSVM_GPR_RSP] >=
+                        sizeof(guest_virtual_stack) ?
+                    result.state.gpr[AMDSVM_GPR_RSP] -
+                        sizeof(guest_virtual_stack) :
+                    result.state.gpr[AMDSVM_GPR_RSP];
+                guest_virtual_stack_status =
+                    amdsvm_debug_guest_virtual_read(result.state.cr[3],
+                        result.state.cr[4], guest_virtual_stack_address,
+                        guest_virtual_stack, sizeof(guest_virtual_stack),
+                        &stack_walk);
+                if (guest_virtual_idt_status == 0) {
+                    uint64_t offset =
+                        (uint64_t)guest_virtual_idt_df[0] |
+                        ((uint64_t)guest_virtual_idt_df[1] << 8) |
+                        ((uint64_t)guest_virtual_idt_df[6] << 16) |
+                        ((uint64_t)guest_virtual_idt_df[7] << 24) |
+                        ((uint64_t)guest_virtual_idt_df[8] << 32) |
+                        ((uint64_t)guest_virtual_idt_df[9] << 40) |
+                        ((uint64_t)guest_virtual_idt_df[10] << 48) |
+                        ((uint64_t)guest_virtual_idt_df[11] << 56);
+                    uint16_t selector = (uint16_t)guest_virtual_idt_df[2] |
+                        ((uint16_t)guest_virtual_idt_df[3] << 8);
+                    if (selector == cs->selector) {
+                        guest_virtual_handler_address = offset;
+                        guest_virtual_handler_status =
+                            amdsvm_debug_guest_virtual_read(
+                                result.state.cr[3], result.state.cr[4],
+                                guest_virtual_handler_address,
+                                guest_virtual_df_handler,
+                                sizeof(guest_virtual_df_handler),
+                                &handler_walk);
+                    }
+                }
+                amdsvm_log_guest_virtual_read("rip",
+                    guest_virtual_code_address,
+                    guest_virtual_code_status, &code_walk,
+                    guest_virtual_code, sizeof(guest_virtual_code));
+                amdsvm_log_guest_virtual_read("idt_df",
+                    guest_virtual_idt_address,
+                    guest_virtual_idt_status, &idt_walk,
+                    guest_virtual_idt_df, sizeof(guest_virtual_idt_df));
+                amdsvm_log_guest_virtual_read("cr2",
+                    result.state.cr[2], guest_virtual_cr2_status,
+                    &cr2_walk, guest_virtual_cr2,
+                    sizeof(guest_virtual_cr2));
+                amdsvm_log_guest_virtual_read("stack",
+                    guest_virtual_stack_address,
+                    guest_virtual_stack_status, &stack_walk,
+                    guest_virtual_stack, sizeof(guest_virtual_stack));
+                if (guest_virtual_handler_address != 0) {
+                    amdsvm_log_guest_virtual_read("df_handler",
+                        guest_virtual_handler_address,
+                        guest_virtual_handler_status, &handler_walk,
+                        guest_virtual_df_handler,
+                        sizeof(guest_virtual_df_handler));
+                }
+            }
+            amdsvm_format_bytes(guest_code_hex, sizeof(guest_code_hex),
+                                guest_code, sizeof(guest_code));
+            amdsvm_format_bytes(idt_df_hex, sizeof(idt_df_hex), idt_df,
+                                sizeof(idt_df));
+            amdsvm_format_bytes(idt_gp_hex, sizeof(idt_gp_hex), idt_gp,
+                                sizeof(idt_gp));
+            amdsvm_format_bytes(idt_pf_hex, sizeof(idt_pf_hex), idt_pf,
+                                sizeof(idt_pf));
+            amdsvm_format_bytes(gdt_cs_hex, sizeof(gdt_cs_hex), gdt_cs,
+                                sizeof(gdt_cs));
+            amdsvm_format_bytes(gdt_ss_hex, sizeof(gdt_ss_hex), gdt_ss,
+                                sizeof(gdt_ss));
+            amdsvm_format_bytes(df_handler_hex, sizeof(df_handler_hex),
+                                df_handler, sizeof(df_handler));
+            amdsvm_format_bytes(gp_handler_hex, sizeof(gp_handler_hex),
+                                gp_handler, sizeof(gp_handler));
+
+            error_report("AMDVM_TRIPLE_FAULT_CONTEXT vcpu=%d rip=0x%llx rflags=0x%llx interruptibility=0x%x exit_int_info=0x%x qemu_eventinj=0x%llx cs=%04x/%04x:%08x:0x%llx ss=%04x/%04x:%08x:0x%llx gdtr=%04x/%04x:%08x:0x%llx idtr=%04x/%04x:%08x:0x%llx cr0=0x%llx cr2=0x%llx cr3=0x%llx cr4=0x%llx efer=0x%llx rsp=0x%llx rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx rsi=0x%llx rdi=0x%llx rbp=0x%llx xcr0=0x%llx",
+                         cpu->cpu_index,
+                         (unsigned long long)result.state.rip,
+                         (unsigned long long)result.state.rflags,
+                         result.state.interruptibility,
+                         result.exit_int_info,
+                         (unsigned long long)run.event_injection,
+                         cs->selector, cs->attributes, cs->limit,
+                         (unsigned long long)cs->base,
+                         ss->selector, ss->attributes, ss->limit,
+                         (unsigned long long)ss->base,
+                         gdtr->selector, gdtr->attributes, gdtr->limit,
+                         (unsigned long long)gdtr->base,
+                         idtr->selector, idtr->attributes, idtr->limit,
+                         (unsigned long long)idtr->base,
+                         (unsigned long long)result.state.cr[0],
+                         (unsigned long long)result.state.cr[2],
+                         (unsigned long long)result.state.cr[3],
+                         (unsigned long long)result.state.cr[4],
+                         (unsigned long long)result.state.efer,
+                         (unsigned long long)result.state.gpr[AMDSVM_GPR_RSP],
+                         (unsigned long long)result.state.gpr[AMDSVM_GPR_RAX],
+                         (unsigned long long)result.state.gpr[AMDSVM_GPR_RBX],
+                         (unsigned long long)result.state.gpr[AMDSVM_GPR_RCX],
+                         (unsigned long long)result.state.gpr[AMDSVM_GPR_RDX],
+                         (unsigned long long)result.state.gpr[AMDSVM_GPR_RSI],
+                         (unsigned long long)result.state.gpr[AMDSVM_GPR_RDI],
+                         (unsigned long long)result.state.gpr[AMDSVM_GPR_RBP],
+                         (unsigned long long)result.state.xcr0);
+            error_report("AMDVM_TRIPLE_FAULT_TABLES code_status=%d code=%s idt8_status=%d idt8=%s idt13_status=%d idt13=%s idt14_status=%d idt14=%s gdt_cs_status=%d gdt_cs=%s gdt_ss_status=%d gdt_ss=%s",
+                         code_status, guest_code_hex,
+                         idt_df_status, idt_df_hex,
+                         idt_gp_status, idt_gp_hex,
+                         idt_pf_status, idt_pf_hex,
+                         gdt_cs_status, gdt_cs_hex,
+                         gdt_ss_status, gdt_ss_hex);
+            error_report("AMDVM_TRIPLE_FAULT_HANDLERS df_selector=0x%x df_offset=0x%x df_handler_status=%d df_handler=%s gp_selector=0x%x gp_offset=0x%x gp_handler_status=%d gp_handler=%s",
+                         df_selector, df_offset, df_handler_status,
+                         df_handler_hex, gp_selector, gp_offset,
+                         gp_handler_status, gp_handler_hex);
+            qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+            ret = -EINTR;
+            goto out;
+        }
+        if (result.exit_code == 0x4d &&
+            accel_state->vm_provider.diagnostic_gp_intercept) {
+            error_report("AMDVM_FIRST_GP_STOP vcpu=%d rip=0x%llx error=0x%llx; state captured, exception will not be reinjected",
+                         cpu->cpu_index,
+                         (unsigned long long)result.state.rip,
+                         (unsigned long long)result.exit_info1);
+            /* Keep the exact VMCB-exit state in QEMU and stop the VM before
+             * any guest #GP handler can run or alter the evidence. */
+            if (amdsvm_state_store(cpu, &result.state) != 0) {
+                error_report("AMDVM_FIRST_GP_STOP state-store failed");
+                ret = -EIO;
+                goto out;
+            }
+            amdvm_x86_guest_state_v1_t qemu_after_gp = { 0 };
+            if (amdsvm_state_load(cpu, &qemu_after_gp) == 0) {
+                amdsvm_trace_transition_state("QEMU_STATE_AT_FIRST_GP_STOP",
+                    cpu->cpu_index, &qemu_after_gp, result.exit_code,
+                    result.exit_int_info, run.event_injection);
+            }
+            accel_state->vm_provider.diagnostic_gp_intercept = false;
+            vm_stop(RUN_STATE_PAUSED);
+            ret = -EINTR;
+            goto out;
+        }
+        if (result.exit_code == SVM_EXIT_EXCP_PF &&
+            accel_state->vm_provider.diagnostic_pf_intercept) {
+            const amdvm_x86_segment_state_t *cs =
+                &result.state.segments[AMDVM_X86_SEG_CS];
+            /* SVM intercepts #PF before architectural CR2 is updated. The
+             * faulting linear address is EXITINFO2; keep the incoming CR2
+             * separately as evidence of its pre-fault value. */
+            uint64_t fault_linear = result.exit_info2;
+            uint64_t code_linear = cs->base + result.state.rip;
+            AMDVMGuestPageWalk fault_walk = { 0 };
+            int fault_walk_status = amdsvm_debug_guest_walk_4level(
+                result.state.cr[3], result.state.cr[4], fault_linear,
+                &fault_walk);
+            int state_store_status;
+
+            if (result.exit_info1 > UINT32_MAX) {
+                error_report("AMDVM_DIAGNOSTIC_PF_STOP_INVALID_ERROR vcpu=%d rip=0x%llx error=0x%llx linear=0x%llx; state captured",
+                    cpu->cpu_index,
+                    (unsigned long long)result.state.rip,
+                    (unsigned long long)result.exit_info1,
+                    (unsigned long long)fault_linear);
+                amdsvm_trace_transition_state("PROVIDER_EXIT_FIRST_PF",
+                    cpu->cpu_index, &result.state, result.exit_code,
+                    result.exit_int_info, UINT64_MAX);
+                amdsvm_trace_pf_registers("PROVIDER_EXIT",
+                    cpu->cpu_index, &result.state);
+                accel_state->vm_provider.diagnostic_pf_intercept = false;
+                vm_stop(RUN_STATE_PAUSED);
+                ret = -EINTR;
+                goto out;
+            }
+
+            /* A not-present PF whose current guest page tables resolve the
+             * same address is the anomaly under investigation. Ordinary PFs
+             * must still be delivered to Linux, or the diagnostic itself
+             * would stop boot at its first demand/protection fault. This
+             * diagnostic run is one-vCPU so the page-table walk cannot race
+             * a sibling guest CPU. */
+            if (!amdsvm_pf_mapping_mismatch((uint32_t)result.exit_info1,
+                                             fault_walk_status == 0)) {
+                amdvm_x86_guest_state_v1_t reinject_state = result.state;
+                int event_status;
+
+                if (dispatch_context.defer_external_irq_completion) {
+                    error_report("AMDVM_DIAGNOSTIC_PF_STOP_UNHANDLED vcpu=%d reinjected=%llu rip=0x%llx error=0x%llx linear=0x%llx exit_int_info=0x%x pending_exception=%u; state was not modified",
+                        cpu->cpu_index,
+                        (unsigned long long)diagnostic_pf_reinjected,
+                        (unsigned long long)result.state.rip,
+                        (unsigned long long)result.exit_info1,
+                        (unsigned long long)fault_linear,
+                        result.exit_int_info,
+                        accel_state->pending_events[cpu->cpu_index].exception_pending);
+                    accel_state->vm_provider.diagnostic_pf_intercept = false;
+                    vm_stop(RUN_STATE_PAUSED);
+                    ret = -EINTR;
+                    goto out;
+                }
+                event_status = amdsvm_firmware_complete_event(
+                    &dispatch_context, result.exit_code,
+                    result.exit_int_info, &reinject_state);
+                if (event_status != 0 ||
+                    accel_state->pending_events[cpu->cpu_index].exception_pending) {
+                    error_report("AMDVM_DIAGNOSTIC_PF_STOP_PENDING_EVENT vcpu=%d reinjected=%llu rip=0x%llx error=0x%llx linear=0x%llx exit_int_info=0x%x complete=%d pending_exception=%u pending_nmi=%u pending_irq=%u; state was not modified",
+                        cpu->cpu_index,
+                        (unsigned long long)diagnostic_pf_reinjected,
+                        (unsigned long long)result.state.rip,
+                        (unsigned long long)result.exit_info1,
+                        (unsigned long long)fault_linear,
+                        result.exit_int_info, event_status,
+                        accel_state->pending_events[cpu->cpu_index].exception_pending,
+                        accel_state->pending_events[cpu->cpu_index].nmi_pending,
+                        accel_state->pending_events[cpu->cpu_index].irq_pending);
+                    accel_state->vm_provider.diagnostic_pf_intercept = false;
+                    vm_stop(RUN_STATE_PAUSED);
+                    ret = -EINTR;
+                    goto out;
+                }
+                reinject_state.cr[2] = fault_linear;
+                if (amdsvm_firmware_store_state(&dispatch_context,
+                                                 &reinject_state) != 0 ||
+                    amdsvm_event_queue_page_fault(
+                        &accel_state->pending_events[cpu->cpu_index],
+                        (uint32_t)result.exit_info1) != 0) {
+                    error_report("AMDVM_DIAGNOSTIC_PF_STOP_REINJECT_FAILED vcpu=%d reinjected=%llu rip=0x%llx error=0x%llx linear=0x%llx; state captured, no retry",
+                        cpu->cpu_index,
+                        (unsigned long long)diagnostic_pf_reinjected,
+                        (unsigned long long)result.state.rip,
+                        (unsigned long long)result.exit_info1,
+                        (unsigned long long)fault_linear);
+                    accel_state->vm_provider.diagnostic_pf_intercept = false;
+                    vm_stop(RUN_STATE_PAUSED);
+                    ret = -EINTR;
+                    goto out;
+                }
+                diagnostic_pf_reinjected++;
+                continue;
+            }
+
+            error_report("AMDVM_PF_MAPPING_MISMATCH_STOP vcpu=%d reinjected=%llu rip=0x%llx error=0x%llx linear=0x%llx cr2_before_pf=0x%llx cr3=0x%llx walk_status=%d level=%d pml4e=0x%llx pdpte=0x%llx pde=0x%llx pte=0x%llx exit_int_info=0x%x run_eventinj=0x%x",
+                cpu->cpu_index,
+                (unsigned long long)diagnostic_pf_reinjected,
+                (unsigned long long)result.state.rip,
+                (unsigned long long)result.exit_info1,
+                (unsigned long long)fault_linear,
+                (unsigned long long)result.state.cr[2],
+                (unsigned long long)result.state.cr[3],
+                fault_walk_status, fault_walk.failed_level,
+                (unsigned long long)fault_walk.entries[0],
+                (unsigned long long)fault_walk.entries[1],
+                (unsigned long long)fault_walk.entries[2],
+                (unsigned long long)fault_walk.entries[3],
+                result.exit_int_info, run.event_injection);
+            /* Freeze the guest before walking its page tables: another vCPU
+             * must not make a post-fault PTE look like the faulting value. */
+            amdsvm_trace_transition_state("PROVIDER_EXIT_MAPPING_MISMATCH_PF",
+                cpu->cpu_index, &result.state, result.exit_code,
+                result.exit_int_info, UINT64_MAX);
+            amdsvm_trace_pf_registers("PROVIDER_EXIT", cpu->cpu_index,
+                &result.state);
+            state_store_status = amdsvm_state_store(cpu, &result.state);
+            accel_state->vm_provider.diagnostic_pf_intercept = false;
+            error_report("AMDVM_PF_MAPPING_MISMATCH_STOP: captured exact #PF state; exception will not be reinjected");
+            vm_stop(RUN_STATE_PAUSED);
+            if (state_store_status != 0) {
+                error_report("AMDVM_PF_MAPPING_MISMATCH_STOP state-store failed");
+                ret = -EIO;
+                goto out;
+            }
+
+            amdvm_x86_guest_state_v1_t qemu_after_pf = { 0 };
+            if (amdsvm_state_load(cpu, &qemu_after_pf) == 0) {
+                amdsvm_trace_transition_state("QEMU_STATE_AT_MAPPING_MISMATCH_PF",
+                    cpu->cpu_index, &qemu_after_pf, result.exit_code,
+                    result.exit_int_info, UINT64_MAX);
+                amdsvm_trace_pf_registers("QEMU_AFTER_STORE",
+                    cpu->cpu_index, &qemu_after_pf);
+            }
+            uint8_t code[16] = { 0 };
+            AMDVMGuestPageWalk code_walk = { 0 };
+            int code_read_status = amdsvm_debug_guest_virtual_read(
+                result.state.cr[3], result.state.cr[4], code_linear,
+                code, sizeof(code), &code_walk);
+
+            /* The provider state is the hardware-exit snapshot; emit the
+             * same architectural fields after storing them into QEMU so the
+             * two sides can be compared without relying on a post-handler
+             * guest snapshot. EVENTINJ is not part of the current RUN result
+             * layout; retain request eventinj and EXITINTINFO. The provider's
+             * one-time VMCB log is from the first intercepted PF, which may
+             * precede this mismatch. */
+            error_report("AMDVM_PF_MAPPING_MISMATCH_ADDRESS vcpu=%d rip=0x%llx next_rip=0x%llx error=0x%llx exitinfo2=0x%llx pf_linear=0x%llx cr2_before_pf=0x%llx run_request_eventinj=0x%x code_read=%d code=%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x",
+                         cpu->cpu_index,
+                         (unsigned long long)result.state.rip,
+                         (unsigned long long)result.next_rip,
+                         (unsigned long long)result.exit_info1,
+                         (unsigned long long)result.exit_info2,
+                         (unsigned long long)fault_linear,
+                         (unsigned long long)result.state.cr[2],
+                         run.event_injection,
+                         code_read_status, code[0], code[1], code[2],
+                         code[3], code[4], code[5], code[6], code[7],
+                         code[8], code[9], code[10], code[11], code[12],
+                         code[13], code[14], code[15]);
+            error_report("AMDVM_PF_MAPPING_MISMATCH_WALK status=%d level=%d gpa=0x%llx pml4e=0x%llx pdpte=0x%llx pde=0x%llx pte=0x%llx code_walk=%d code_gpa=0x%llx code_pml4e=0x%llx code_pdpte=0x%llx code_pde=0x%llx code_pte=0x%llx",
+                         fault_walk_status, fault_walk.failed_level,
+                         (unsigned long long)fault_walk.gpa,
+                         (unsigned long long)fault_walk.entries[0],
+                         (unsigned long long)fault_walk.entries[1],
+                         (unsigned long long)fault_walk.entries[2],
+                         (unsigned long long)fault_walk.entries[3],
+                         code_read_status,
+                         (unsigned long long)code_walk.gpa,
+                         (unsigned long long)code_walk.entries[0],
+                         (unsigned long long)code_walk.entries[1],
+                         (unsigned long long)code_walk.entries[2],
+                         (unsigned long long)code_walk.entries[3]);
+            ret = -EINTR;
+            goto out;
+        }
+        int64_t dispatch_started_us = amdsvm_perf_enabled(accel_state) ?
+            g_get_monotonic_time() : 0;
+        AMDVMFirmwareDispatchAction dispatch_action =
+            amdsvm_dispatch_firmware_exit(&run, &result, &dispatch_ops,
+                                           &dispatch_context);
+        if (dispatch_started_us) {
+            amdsvm_perf_record_dispatch(accel_state, cpu->cpu_index,
+                g_get_monotonic_time() - dispatch_started_us);
+        }
+        dispatch_context.defer_external_irq_completion = false;
+        if (dispatch_action == AMDVM_FIRMWARE_DISPATCH_RESET) {
+            error_report("AMD-SVM received completed SVM_EXIT_ERR; requesting guest reset");
+            qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+            ret = -EINTR;
+            goto out;
+        }
+        switch (dispatch_action) {
         case AMDVM_FIRMWARE_DISPATCH_CONTINUE:
+            if (accel_state->diagnostic_gp_rearm_pending[cpu->cpu_index]) {
+                accel_state->vm_provider.diagnostic_gp_intercept = true;
+                accel_state->diagnostic_gp_rearm_pending[cpu->cpu_index] =
+                    false;
+                error_report("AMDVM_DIAGNOSTIC_GP_REARMED vcpu=%d after guest event completion",
+                             cpu->cpu_index);
+            }
             /*
              * SeaBIOS enables PCI option-ROM/PAM shadowing through config
              * I/O. That changes QEMU's FlatView while this execute call is
@@ -3009,8 +4914,7 @@ static int amdsvm_run_qemu_firmware(CPUState *cpu,
                     ret = -EINVAL;
                     goto out;
                 }
-                if (memcmp(&guest_map, &updated_map,
-                           sizeof(updated_map)) != 0) {
+                if (!amdsvm_memory_map_equal(&guest_map, &updated_map)) {
                     if (accel_state->vm_api) {
                         ret = amdsvm_vm_api_refresh_map(accel_state, cpu,
                                                         &updated_map);
@@ -3347,19 +5251,31 @@ static int amdsvm_init_machine(AccelState *accel, MachineState *machine)
 
     AMDVMAccelState *state = (AMDVMAccelState *)accel;
 
-    /* Guest-independent experimental RUN. Selecting this profile enables
-     * the VM-scoped API; resource choices remain bounded for this release. */
+    if (!state->vm_api &&
+        (state->mtrr_cache_enabled || state->provider_pause_enabled)) {
+        error_report("AMD-SVM mtrr-cache and provider-pause require vm-api=on");
+        return -EINVAL;
+    }
+
+    if (state->perf_stats && !state->perf_stats_data) {
+        state->perf_stats_data = g_new0(AMDVMPerfStats, 1);
+        state->perf_state_entry = qemu_add_vm_change_state_handler(
+            amdsvm_perf_vm_state_change, state);
+    }
+
+    /* Keep the publication's guest-independent opt-in and a bounded
+     * resource envelope for this experimental build. */
     if (state->confirm_experimental_run) {
         state->vm_api = true;
     }
     if (state->confirm_experimental_run &&
         (state->diagnostic_only || state->confirm_finite_kick_test ||
          state->confirm_finite_smp_test || state->confirm_unbounded_vmrun ||
-         machine->smp.cpus < 1 || machine->smp.cpus > 2 ||
+         machine->smp.cpus < 1 || machine->smp.cpus > 8 ||
          machine->smp.max_cpus != machine->smp.cpus ||
          machine->ram_size < UINT64_C(256) * 1024 * 1024 ||
-         machine->ram_size > UINT64_C(4) * 1024 * 1024 * 1024)) {
-        error_report("AMD-SVM experimental RUN supports 1..2 vCPUs, 256 MiB..4 GiB RAM, no CPU hotplug, and no other RUN confirmation");
+         machine->ram_size > UINT64_C(16) * 1024 * 1024 * 1024)) {
+        error_report("AMD-SVM experimental RUN supports 1..8 vCPUs, 256 MiB..16 GiB RAM, no CPU hotplug, and no other RUN confirmation");
         return -EINVAL;
     }
 
@@ -3382,14 +5298,8 @@ static int amdsvm_init_machine(AccelState *accel, MachineState *machine)
         error_report("AMD-SVM finite-SMP ROM validation is diagnostic-only and restricted to 2 vCPUs and exactly 4 GiB");
         return -EINVAL;
     }
-    /* Diagnostic preparation is unrestricted by RUN policy. Guest execution
-     * requires explicit experimental RUN or the separate finite ROM profile. */
-    if (state->vm_api && !state->diagnostic_only &&
-        machine->smp.cpus > 1 && !state->confirm_finite_smp_test &&
-        !state->confirm_experimental_run) {
-        error_report("AMD-SVM multi-vCPU execution requires the reviewed finite-SMP ROM profile or explicit experimental RUN profile");
-        return -ENOTSUP;
-    }
+    /* Multi-vCPU VM API RUN is allowed with the generic unbounded-VMRUN
+     * confirmation; the finite and publication profiles keep their own checks. */
     /* CPU hotplug has no provider create/destroy hook yet. */
     if (state->vm_api && !state->diagnostic_only &&
         machine->smp.max_cpus != machine->smp.cpus) {
@@ -3503,8 +5413,38 @@ static int amdsvm_init_machine(AccelState *accel, MachineState *machine)
     }
     state->connection = connection;
     if (state->vm_api) {
-        if (amdsvm_vm_provider_init(&state->vm_provider, amdsvm_iokit_provider_transport, state) ||
-            machine->smp.max_cpus > state->vm_provider.caps.max_vcpus ||
+        if (amdsvm_vm_provider_init(&state->vm_provider,
+                                    amdsvm_iokit_provider_transport, state)) {
+            error_report("AMD-SVM VM API capability negotiation or host probe failed");
+            IOServiceClose(connection); state->connection = IO_OBJECT_NULL; return -ENOTSUP;
+        }
+        fprintf(stderr,
+                "AMD-SVM VM API negotiated state_abi=%u feature_flags=0x%016" PRIx64 "\n",
+                state->vm_provider.state_abi,
+                state->vm_provider.caps.feature_flags);
+        if ((state->mtrr_cache_enabled && !(state->vm_provider.caps.feature_flags &
+               AMDVM_VM_ABI_DRAFT_FEATURE_MTRR_PAT_CACHE_V1)) ||
+            (state->provider_pause_enabled && !(state->vm_provider.caps.feature_flags &
+               AMDVM_VM_ABI_DRAFT_FEATURE_PROVIDER_PAUSE_STATS_V1)) ||
+            (state->native_cr3_enabled && !(state->vm_provider.caps.feature_flags &
+               AMDVM_VM_ABI_DRAFT_FEATURE_NATIVE_CR3_V1))) {
+            error_report("AMD-SVM requested optimizer gate is not advertised by provider");
+            IOServiceClose(connection);
+            state->connection = IO_OBJECT_NULL;
+            return -ENOTSUP;
+        }
+        state->vm_provider.mtrr_cache_enabled = state->mtrr_cache_enabled;
+        state->vm_provider.provider_pause_enabled = state->provider_pause_enabled;
+        fprintf(stderr, "AMD-SVM RUN gates mtrr-cache=%u provider-pause=%u bql-spin=%u\n",
+                state->mtrr_cache_enabled, state->provider_pause_enabled,
+                state->bql_spin_enabled);
+        if ((state->vm_provider.caps.feature_flags &
+             AMDVM_VM_ABI_DRAFT_FEATURE_PROVIDER_PAUSE_STATS_V1) &&
+            !state->perf_state_entry) {
+            state->perf_state_entry = qemu_add_vm_change_state_handler(
+                amdsvm_perf_vm_state_change, state);
+        }
+        if (machine->smp.max_cpus > state->vm_provider.caps.max_vcpus ||
             amdsvm_probe_host_state(&state->cpu_state_before)) {
             error_report("AMD-SVM VM API capability negotiation or host probe failed");
             IOServiceClose(connection); state->connection = IO_OBJECT_NULL; return -ENOTSUP;
@@ -3520,6 +5460,58 @@ static int amdsvm_init_machine(AccelState *accel, MachineState *machine)
             state->connection = IO_OBJECT_NULL;
             return -ENOTSUP;
         }
+        if (amdsvm_state_set_abi_version(state->vm_provider.state_abi) != 0) {
+            error_report("AMD-SVM provider advertised an unsupported state ABI");
+            IOServiceClose(connection);
+            state->connection = IO_OBJECT_NULL;
+            return -ENOTSUP;
+        }
+        if (state->diagnostic_gp_intercept) {
+            if (!(state->vm_provider.caps.feature_flags &
+                  AMDVM_VM_ABI_DRAFT_FEATURE_DIAGNOSTIC_GP_INTERCEPT)) {
+                error_report("AMD-SVM provider lacks DIAGNOSTIC_GP_INTERCEPT; VMRUN was not called");
+                IOServiceClose(connection);
+                state->connection = IO_OBJECT_NULL;
+                return -ENOTSUP;
+            }
+            state->vm_provider.diagnostic_gp_intercept = true;
+        }
+        if (state->diagnostic_first_pf) {
+            if (!(state->vm_provider.caps.feature_flags &
+                  AMDVM_VM_ABI_DRAFT_FEATURE_DIAGNOSTIC_PF_INTERCEPT)) {
+                error_report("AMD-SVM provider lacks DIAGNOSTIC_PF_INTERCEPT; VMRUN was not called");
+                IOServiceClose(connection);
+                state->connection = IO_OBJECT_NULL;
+                return -ENOTSUP;
+            }
+            state->vm_provider.diagnostic_pf_intercept = true;
+        }
+        if (!state->diagnostic_only && state->shared_run_enabled &&
+            (state->vm_provider.caps.feature_flags &
+             AMDVM_VM_ABI_DRAFT_FEATURE_SHARED_VCPU_RUN_V1)) {
+            mach_vm_address_t address = 0;
+            mach_vm_size_t mapped_size = 0;
+            kern_return_t map_status = IOConnectMapMemory64(connection,
+                AMDVM_VM_ABI_DRAFT_SHARED_RUN_MEMORY_TYPE,
+                mach_task_self(), &address, &mapped_size, kIOMapAnywhere);
+            if (map_status == KERN_SUCCESS &&
+                mapped_size >= sizeof(amdvm_vm_shared_run_area_t)) {
+                state->shared_run_mapping_address = address;
+                state->shared_run_mapping_size = mapped_size;
+                state->shared_run_mapped = true;
+                state->vm_provider.shared_run_area =
+                    (amdvm_vm_shared_run_area_t *)(uintptr_t)address;
+                fprintf(stderr, "AMD-SVM shared RUN mapping active size=%llu\n",
+                        (unsigned long long)mapped_size);
+            } else {
+                if (map_status == KERN_SUCCESS) {
+                    (void)IOConnectUnmapMemory64(connection,
+                        AMDVM_VM_ABI_DRAFT_SHARED_RUN_MEMORY_TYPE,
+                        mach_task_self(), address);
+                }
+                error_report("AMD-SVM shared RUN mapping unavailable; using the legacy RUN selector");
+            }
+        }
         state->vm_expected_cpus = machine->smp.cpus;
     }
     amdsvm_state_init_emulator();
@@ -3528,6 +5520,10 @@ static int amdsvm_init_machine(AccelState *accel, MachineState *machine)
     qatomic_set(&state->kick_generation, 0);
     qemu_mutex_init(&state->kick_lock);
     state->kick_lock_initialized = true;
+    if (state->vm_api) {
+        qemu_mutex_init(&state->vm_context_lock);
+        state->vm_context_lock_initialized = true;
+    }
     amdsvm_active_state = state;
     return 0;
 }
@@ -3540,6 +5536,15 @@ static void amdsvm_accel_finalize(Object *obj)
 
     if (amdsvm_active_state == state) {
         amdsvm_active_state = NULL;
+    }
+    if (state->perf_state_entry) {
+        qemu_del_vm_change_state_handler(state->perf_state_entry);
+        state->perf_state_entry = NULL;
+    }
+    if (state->perf_stats_data) {
+        amdsvm_perf_dump(state, "finalize");
+        g_free(state->perf_stats_data);
+        state->perf_stats_data = NULL;
     }
     amdsvm_host_tlb_stress_stop(state);
     if (state->vm_api) {
@@ -3564,9 +5569,28 @@ static void amdsvm_accel_finalize(Object *obj)
          * race a failed explicit destroy and free provider-owned backing. */
         provider_context_retained = true;
     }
+    if (state->shared_run_mapped && !provider_context_retained &&
+        state->connection != IO_OBJECT_NULL) {
+        kern_return_t unmap_status = IOConnectUnmapMemory64(
+            state->connection, AMDVM_VM_ABI_DRAFT_SHARED_RUN_MEMORY_TYPE,
+            mach_task_self(), state->shared_run_mapping_address);
+        if (unmap_status == KERN_SUCCESS) {
+            state->shared_run_mapped = false;
+            state->shared_run_mapping_address = 0;
+            state->shared_run_mapping_size = 0;
+            state->vm_provider.shared_run_area = NULL;
+        } else {
+            error_report("AMD-SVM shared RUN mapping could not be unmapped (mach 0x%x); preserving provider connection", unmap_status);
+            provider_context_retained = true;
+        }
+    }
     if (state->kick_lock_initialized) {
         qemu_mutex_destroy(&state->kick_lock);
         state->kick_lock_initialized = false;
+    }
+    if (state->vm_context_lock_initialized) {
+        qemu_mutex_destroy(&state->vm_context_lock);
+        state->vm_context_lock_initialized = false;
     }
     if (state->connection != IO_OBJECT_NULL && !provider_context_retained) {
         IOServiceClose(state->connection);
@@ -3582,7 +5606,7 @@ static void amdsvm_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
 
-    ac->name = "AMD SVM provider (experimental QEMU accelerator)";
+    ac->name = "AMD SVM provider (experimental QEMU firmware)";
     ac->init_machine = amdsvm_init_machine;
     ac->allowed = &amdsvm_allowed;
     object_class_property_add_bool(oc, "confirm-no-kdp-watchpoints",
@@ -3606,10 +5630,38 @@ static void amdsvm_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_bool(oc, "trace-vmexit",
                                    amdsvm_get_trace_vmexit,
                                    amdsvm_set_trace_vmexit);
+    object_class_property_add_bool(oc, "perf-stats",
+                                   amdsvm_get_perf_stats,
+                                   amdsvm_set_perf_stats);
+    object_class_property_add_bool(oc, "diagnostic-cr0-window-trace",
+                                   amdsvm_get_diagnostic_cr0_window_trace,
+                                   amdsvm_set_diagnostic_cr0_window_trace);
+    object_class_property_add_bool(oc, "diagnostic-transition-irq-gate",
+                                   amdsvm_get_diagnostic_transition_irq_gate,
+                                   amdsvm_set_diagnostic_transition_irq_gate);
+    object_class_property_add_bool(oc, "diagnostic-gp-intercept",
+                                   amdsvm_get_diagnostic_gp_intercept,
+                                   amdsvm_set_diagnostic_gp_intercept);
+    object_class_property_add_bool(oc, "diagnostic-first-pf",
+                                   amdsvm_get_diagnostic_first_pf,
+                                   amdsvm_set_diagnostic_first_pf);
     object_class_property_add_bool(oc, "diagnostic-only",
                                    amdsvm_get_diagnostic_only,
                                    amdsvm_set_diagnostic_only);
     object_class_property_add_bool(oc, "vm-api", amdsvm_get_vm_api, amdsvm_set_vm_api);
+    object_class_property_add_bool(oc, "bql-spin", amdsvm_get_bql_spin,
+                                   amdsvm_set_bql_spin);
+    object_class_property_add_bool(oc, "mtrr-cache", amdsvm_get_mtrr_cache,
+                                   amdsvm_set_mtrr_cache);
+    object_class_property_add_bool(oc, "provider-pause", amdsvm_get_provider_pause,
+                                   amdsvm_set_provider_pause);
+    object_class_property_add_bool(oc, "shared-run", amdsvm_get_shared_run,
+                                   amdsvm_set_shared_run);
+    object_class_property_add_bool(oc, "native-rdtsc", amdsvm_get_native_rdtsc,
+                                   amdsvm_set_native_rdtsc);
+    object_class_property_add_bool(oc, "native-cr3",
+                                   amdsvm_get_native_cr3,
+                                   amdsvm_set_native_cr3);
     object_class_property_add_bool(oc, "diagnostic-validate-ram-map",
                                    amdsvm_get_diagnostic_validate_ram_map,
                                    amdsvm_set_diagnostic_validate_ram_map);
@@ -3620,10 +5672,29 @@ static void amdsvm_accel_class_init(ObjectClass *oc, const void *data)
                                   amdsvm_set_debugcon);
 }
 
+static void amdsvm_accel_instance_init(Object *obj)
+{
+    AMDVMAccelState *s = (AMDVMAccelState *)obj;
+
+    s->shared_run_enabled = true;
+    /* Native RDTSC is still experimental: on the 2026-10-29 Alpine 8-vCPU
+     * profile it stalled in pv_native_safe_halt, while the same binary with
+     * native-rdtsc=off reached login. Keep it explicit opt-in until the TSC
+     * offset and timer interaction are validated across SMP and RAM sizes. */
+    s->native_rdtsc_enabled = false;
+    s->native_cr3_enabled = false;
+    s->host_phys_bits = amdsvm_state_host_phys_bits();
+    /* The bounded try-lock improved SMP guest progress in the 2026-10-28
+     * Alpine A/B. Keep the regular BQL acquisition as a bounded fallback;
+     * users can still opt out with bql-spin=off. */
+    s->bql_spin_enabled = true;
+}
+
 static const TypeInfo amdsvm_accel_type = {
     .name = ACCEL_CLASS_NAME("amdsvm"),
     .parent = TYPE_ACCEL,
     .instance_size = sizeof(AMDVMAccelState),
+    .instance_init = amdsvm_accel_instance_init,
     .instance_finalize = amdsvm_accel_finalize,
     .class_init = amdsvm_accel_class_init,
 };

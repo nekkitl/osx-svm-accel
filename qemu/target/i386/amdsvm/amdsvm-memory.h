@@ -33,4 +33,14 @@ bool amdsvm_build_memory_type_request(
     amdvm_vcpu_set_memory_types_request_t *request,
     Error **errp);
 
+/* Build against the exact map segmentation pinned by the VM provider. */
+bool amdsvm_build_published_memory_type_request(
+    const AMDVMGuestMemoryMap *current_map,
+    const AMDVMGuestMemoryMap *pinned_map,
+    bool provider_map_is_authoritative,
+    const AMDVMMTRRState *mtrr,
+    AMDVMGuestMTRRPolicy policy,
+    amdvm_vcpu_set_memory_types_request_t *request,
+    Error **errp);
+
 #endif

@@ -1,3 +1,14 @@
+# Publication snapshot — 2026-11-17
+
+- Refresh the stock-XNU provider and the QEMU 11.1.50 overlay from the v5 development tree, using the same pinned upstream QEMU revision.
+- Share the VM NPT map across vCPUs. Retain per-vCPU CPU state and use scatter-backed NPT allocation for larger maps. Preserve the ordered host page vector and reuse the current NPT leaf table during sequential mapping.
+- Add x86 state ABI v3 negotiation, shared RUN transport, tighter RUN lifetime accounting, reusable buffers, and conservative VMCB clean-bit and TLB handling.
+- Update the QEMU string-I/O state synchronization and no-entry KICK result handling. Add optional RUN counters, bounded BQL reacquisition, and capability checks for native CR3, RDTSC, PAUSE and MTRR caching.
+- Expand the public experimental profile to 1–8 vCPUs and 256 MiB–16 GiB, with CPU hotplug rejected. Document observed boots, regressions and the TCG controls.
+- Package the latest unsigned provider separately. It adds page-fault diagnostics and remains a candidate for hardware evaluation.
+
+Русская сводка и цифры приведены в [документации по замерам](docs/ru/hardware.md).
+
 # Publication snapshot — 2026-10-14
 
 Experimental source package; no production-stability claim.

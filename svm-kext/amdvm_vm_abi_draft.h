@@ -31,6 +31,8 @@
 #define AMDVM_VM_ABI_DRAFT_SELECTOR_VM_DESTROY 22u
 #define AMDVM_VM_ABI_DRAFT_SELECTOR_VCPU_DIAGNOSTIC 23u
 #define AMDVM_VM_ABI_DRAFT_SELECTOR_VCPU_GET_STATE 24u
+#define AMDVM_VM_ABI_DRAFT_SELECTOR_VCPU_RUN_SHARED 25u
+#define AMDVM_VM_ABI_DRAFT_SHARED_RUN_MEMORY_TYPE 1u
 
 #define AMDVM_VM_ABI_DRAFT_FEATURE_TRANSACTIONAL_MAP (1ull << 0)
 #define AMDVM_VM_ABI_DRAFT_FEATURE_PER_VCPU_NPT      (1ull << 1)
@@ -41,6 +43,34 @@
 #define AMDVM_VM_ABI_DRAFT_FEATURE_VCPU_KICK_V1      (1ull << 6)
 #define AMDVM_VM_ABI_DRAFT_FEATURE_MAP_REPLACE_V1    (1ull << 7)
 #define AMDVM_VM_ABI_DRAFT_FEATURE_NMI_EVENT_V1      (1ull << 8)
+#define AMDVM_VM_ABI_DRAFT_FEATURE_DIAGNOSTIC_GP_INTERCEPT (1ull << 9)
+/* Guest CR8/V_TPR is transported in state ABI v3 and CR8 exits are disabled. */
+#define AMDVM_VM_ABI_DRAFT_FEATURE_NATIVE_CR8_V1      (1ull << 10)
+#define AMDVM_VM_ABI_DRAFT_FEATURE_NATIVE_RDTSC_V1    (1ull << 11)
+#define AMDVM_VM_ABI_DRAFT_FEATURE_PROVIDER_PAUSE_STATS_V1 (1ull << 12)
+#define AMDVM_VM_ABI_DRAFT_FEATURE_SHARED_VCPU_RUN_V1 (1ull << 13)
+#define AMDVM_VM_ABI_DRAFT_FEATURE_ATOMIC_RUN_SLOT_V1 (1ull << 14)
+#define AMDVM_VM_ABI_DRAFT_FEATURE_MTRR_PAT_CACHE_V1 (1ull << 15)
+#define AMDVM_VM_ABI_DRAFT_FEATURE_NATIVE_CR3_V1  (1ull << 16)
+#define AMDVM_VM_ABI_DRAFT_FEATURE_DIAGNOSTIC_PF_INTERCEPT (1ull << 17)
+/*
+ * v5 source compatibility with the v4 QEMU capability spelling. Both names
+ * describe the same bit. The corresponding request flags are retained only
+ * so QEMU can compile; provider-lockless is fail-closed in QEMU and the v5
+ * provider does not accept these request bits. Do not enable that gate until
+ * its wire semantics are reconciled and separately tested.
+ */
+#define AMDVM_VM_ABI_DRAFT_FEATURE_ATOMIC_SLOT_LIFETIME_V1 \
+	AMDVM_VM_ABI_DRAFT_FEATURE_ATOMIC_RUN_SLOT_V1
+#define AMDVM_VM_ABI_DRAFT_VCPU_CREATE_ATOMIC_SLOT (1u << 0)
+#define AMDVM_VM_ABI_DRAFT_VCPU_RUN_ATOMIC_SLOT    (1u << 2)
+#define AMDVM_VM_ABI_DRAFT_MEMORY_MAP_ATOMIC_SLOT_MODE (1u << 1)
+#define AMDVM_VM_ABI_DRAFT_VCPU_RUN_DIAGNOSTIC_INTERCEPT_GP (1u << 0)
+#define AMDVM_VM_ABI_DRAFT_VCPU_RUN_NATIVE_RDTSC      (1u << 1)
+#define AMDVM_VM_ABI_DRAFT_VCPU_RUN_MTRR_CACHE         (1u << 3)
+#define AMDVM_VM_ABI_DRAFT_VCPU_RUN_PROVIDER_PAUSE     (1u << 4)
+#define AMDVM_VM_ABI_DRAFT_VCPU_RUN_NATIVE_CR3     (1u << 5)
+#define AMDVM_VM_ABI_DRAFT_VCPU_RUN_DIAGNOSTIC_INTERCEPT_PF (1u << 6)
 
 #define AMDVM_VM_ABI_DRAFT_VCPU_DIAG_NPT_ENABLED       (1u << 0)
 #define AMDVM_VM_ABI_DRAFT_VCPU_DIAG_NPT_ROOT_MATCH    (1u << 1)
@@ -182,7 +212,15 @@ typedef struct amdvm_vm_abi_draft_vcpu_run_request {
 	uint32_t event_injection;
 	uint32_t event_injection_error_code;
 	amdvm_x86_guest_state_v1_t state;
+	/* Host-TSC-relative VMCB offset. Valid only with RUN_NATIVE_RDTSC. */
+	uint64_t tsc_offset;
 } amdvm_vm_abi_draft_vcpu_run_request_t;
+
+/* Append-only wire compatibility: old RUN clients omit tsc_offset. */
+#define AMDVM_VM_ABI_DRAFT_VCPU_RUN_REQUEST_V3_SIZE \
+	(sizeof(amdvm_vm_abi_draft_vcpu_run_request_t))
+#define AMDVM_VM_ABI_DRAFT_VCPU_RUN_REQUEST_V2_SIZE \
+	offsetof(amdvm_vm_abi_draft_vcpu_run_request_t, tsc_offset)
 
 typedef struct amdvm_vm_abi_draft_vcpu_run_result {
 	uint32_t abi_version;
@@ -215,6 +253,8 @@ typedef struct amdvm_vm_abi_draft_vcpu_kick_request {
 /* KICK only publishes a generation; caller must first signal the target vCPU
  * host thread so a running guest can exit through its host interrupt path. */
 #define AMDVM_VM_ABI_DRAFT_VCPU_KICK_HOST_SIGNAL_SENT (1u << 0)
+/* Read-only aggregate PAUSE counters; does not publish a kick generation. */
+#define AMDVM_VM_ABI_DRAFT_VCPU_KICK_REPORT_PAUSE_STATS (1u << 1)
 
 typedef struct amdvm_vm_abi_draft_vcpu_kick_result {
 	uint32_t abi_version;
@@ -310,7 +350,7 @@ static_assert(sizeof(amdvm_vm_abi_draft_vcpu_state_request_t) == 4632,
 	"VM ABI draft vCPU state request size");
 static_assert(sizeof(amdvm_vm_abi_draft_vcpu_state_result_t) == 4632,
 	"VM ABI vCPU GET_STATE result size");
-static_assert(sizeof(amdvm_vm_abi_draft_vcpu_run_request_t) == 4648,
+static_assert(sizeof(amdvm_vm_abi_draft_vcpu_run_request_t) == 4656,
 	"VM ABI draft vCPU RUN request size");
 static_assert(sizeof(amdvm_vm_abi_draft_vcpu_run_result_t) == 4704,
 	"VM ABI draft vCPU RUN result size");

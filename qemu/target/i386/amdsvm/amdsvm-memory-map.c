@@ -3,6 +3,64 @@
 
 #include "amdsvm-memory-map.h"
 
+bool amdsvm_memory_map_equal(const AMDVMGuestMemoryMap *a,
+                             const AMDVMGuestMemoryMap *b)
+{
+    uint32_t ai = 0, bi = 0;
+    uint64_t ao = 0, bo = 0;
+
+    if (!a || !b || a->count > AMDSVM_MAX_GUEST_RANGES ||
+        b->count > AMDSVM_MAX_GUEST_RANGES ||
+        a->total_ram != b->total_ram ||
+        a->total_writable_bytes != b->total_writable_bytes ||
+        a->reset_rom_page_present != b->reset_rom_page_present) {
+        return false;
+    }
+    if (a->reset_rom_page_present &&
+        memcmp(a->reset_rom_page, b->reset_rom_page,
+               sizeof(a->reset_rom_page))) {
+        return false;
+    }
+    /* FlatView may split or coalesce a contiguous mapping as device regions
+     * appear. Compare the translated GPA->HVA mapping, not its segmentation,
+     * so an equivalent map does not trigger a full provider rebuild. */
+    while (ai < a->count && bi < b->count) {
+        const AMDVMGuestMemoryRange *ar = &a->ranges[ai];
+        const AMDVMGuestMemoryRange *br = &b->ranges[bi];
+        uint64_t agpa, ahva, bgpa, bhva;
+        uint64_t remaining_a, remaining_b, span;
+
+        if (ao >= ar->size || bo >= br->size ||
+            ar->guest_physical_address > UINT64_MAX - ao ||
+            ar->host_virtual_address > UINT64_MAX - ao ||
+            br->guest_physical_address > UINT64_MAX - bo ||
+            br->host_virtual_address > UINT64_MAX - bo) {
+            return false;
+        }
+        agpa = ar->guest_physical_address + ao;
+        ahva = ar->host_virtual_address + ao;
+        bgpa = br->guest_physical_address + bo;
+        bhva = br->host_virtual_address + bo;
+        if (agpa != bgpa || ahva != bhva || ar->flags != br->flags) {
+            return false;
+        }
+        remaining_a = ar->size - ao;
+        remaining_b = br->size - bo;
+        span = MIN(remaining_a, remaining_b);
+        ao += span;
+        bo += span;
+        if (ao == ar->size) {
+            ai++;
+            ao = 0;
+        }
+        if (bo == br->size) {
+            bi++;
+            bo = 0;
+        }
+    }
+    return ai == a->count && bi == b->count;
+}
+
 static bool amdsvm_memory_map_append_coalesced(
     AMDVMGuestMemoryMap *map, uint64_t gpa, uint64_t hva,
     uint64_t size, uint32_t flags, Error **errp)
@@ -100,10 +158,13 @@ bool amdsvm_memory_map_append_flatview_range(
 bool amdsvm_memory_backing_alias_allowed(uint32_t first_flags,
                                         uint32_t second_flags)
 {
-    const uint32_t rom_flags = AMDVM_VCPU_MEMORY_READ |
-                               AMDVM_VCPU_MEMORY_EXEC;
+    const uint32_t valid_flags = AMDVM_VCPU_MEMORY_READ |
+                                 AMDVM_VCPU_MEMORY_WRITE |
+                                 AMDVM_VCPU_MEMORY_EXEC;
 
-    return first_flags == rom_flags && second_flags == rom_flags;
+    return first_flags == second_flags &&
+           (first_flags & AMDVM_VCPU_MEMORY_READ) != 0 &&
+           (first_flags & ~valid_flags) == 0;
 }
 
 int amdsvm_memory_map_append_range(

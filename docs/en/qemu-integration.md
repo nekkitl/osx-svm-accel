@@ -1,6 +1,6 @@
 # QEMU source overlay
 
-Base: `f9587d4045c67cd0d8d8bdcd5d0bb5b6b395b63c` from <https://github.com/qemu/qemu>. [manifest.json](../../qemu/manifest.json) records every exported path, upstream SHA-256 (null for additions), and publication SHA-256. The 40-file overlay includes all tracked modifications and AMDVM additions from the reference checkout. The full tree is not vendored.
+Base: `f9587d4045c67cd0d8d8bdcd5d0bb5b6b395b63c` from <https://github.com/qemu/qemu>. [manifest.json](../../qemu/manifest.json) records every exported path, upstream SHA-256 (null for additions), and publication SHA-256. The 51-file overlay includes all tracked modifications and AMDVM additions from the reference checkout. The full tree is not vendored.
 
 `tools/prepare-qemu.py` checks the exact Git HEAD, rejects unrelated tracked changes and validates all original/overlay file hashes before copying. It supports idempotent reapplication. `tools/build-qemu.sh` configures Darwin x86_64, amdsvm, Cocoa and SLIRP. Downloaded source/build directories are ignored.
 
@@ -16,8 +16,8 @@ Base: `f9587d4045c67cd0d8d8bdcd5d0bb5b6b395b63c` from <https://github.com/qemu/q
 | `target/i386/emulate/*`, `target/i386/hvf/*` | share/reconcile x86 emulation helpers; preserve upstream notices |
 | `hw/display/vga.c`, `system/ioport.c` | bounded device-I/O diagnostics retained from reference development |
 | root/target/accel Meson, Kconfig, option files, `svm.h` | registration, IOKit dependency and build integration; pinned SLIRP fallback |
-| `tests/unit/test-amdsvm-*`, unit Meson | six offline test programs |
+| `tests/unit/test-amdsvm-*`, unit Meson | eight offline test programs |
 
-Public frontend differences from the hardware reference binary: replace `confirm-alpine-smp` with `confirm-experimental-run`, select the VM API with that flag, and admit 1–2 vCPUs / 256 MiB–4 GiB rather than two exact RAM sizes. World-switch, exit handling and the AP HLT-latch fix are unchanged. The broader admission range and other guest OSes are not established by the earlier tests.
+The public `confirm-experimental-run=on` property selects VM API mode for 1–8 vCPUs and 256 MiB–16 GiB. The source delta against v5 is recorded in [public-interface.diff](../../qemu/public-interface.diff). Shared RUN is used when the paired provider advertises it. The archived candidate was compiled with PAUSE and native CR3 capability, without optional shared RUN and native RDTSC capability.
 
 No boot payload, ISO path or guest kernel command line is selected by this frontend. The explicit finite-ROM byte matchers remain diagnostic test modes. See [build and run](build-and-run.md) and [manifest](../../MANIFEST.json).

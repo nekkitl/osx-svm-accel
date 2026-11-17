@@ -16,4 +16,12 @@ amdvm_kick_generation_should_dispatch(uint64_t request, uint64_t current)
 	return request == current || amdvm_generation_newer(request, current);
 }
 
+/* A statistics-only KICK observes the generation but must never publish one. */
+static inline int
+amdvm_kick_generation_should_update(uint64_t request, uint64_t current,
+	int report_only)
+{
+	return !report_only && amdvm_generation_newer(request, current);
+}
+
 #endif /* AMDVM_KICK_LOGIC_H */

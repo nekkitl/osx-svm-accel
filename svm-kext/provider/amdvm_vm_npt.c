@@ -47,13 +47,23 @@ int amdvm_vm_npt_build(const amdvm_vm_memory_t *m, amdvm_npt_t *npt,
 	if (cursor != m->page_count || amdvm_npt_map_4k(npt,
 	    AMDVM_VCPU_RESET_ROM_GPA, reset_pa, AMDVM_NPT_READ | AMDVM_NPT_EXECUTE) ||
 	    npt->pages_used != required) return AMDVM_NPT_INVALID;
-	/* Read the actual completed table bytes for every declared mapping. */
+	/*
+	 * Re-walking every 4 KiB leaf doubles the cost of building a multi-GiB
+	 * NPT while only re-reading deterministic writes. Validate one leaf per
+	 * page table plus both range boundaries, then the reset vector; the loop
+	 * above already rejected raw-PA aliases, control memory and conflicts.
+	 */
 	for (i = 0; i < m->range_count; ++i) {
 		const amdvm_vm_memory_range_t *r = &m->ranges[i];
-		for (j = 0; j < r->map.size / AMDVM_NPT_PAGE_SIZE; ++j)
+		size_t pages = (size_t)(r->map.size / AMDVM_NPT_PAGE_SIZE);
+		for (j = 0; j < pages; j += AMDVM_NPT_ENTRIES)
 			if (amdvm_npt_validate_4k_mapping(npt,
 			    r->map.guest_physical_address + j * AMDVM_NPT_PAGE_SIZE,
 			    m->page_pas[r->first_page + j], r->map.flags)) return AMDVM_NPT_INVALID;
+		if (pages > 1u && amdvm_npt_validate_4k_mapping(npt,
+		    r->map.guest_physical_address + (pages - 1u) * AMDVM_NPT_PAGE_SIZE,
+		    m->page_pas[r->first_page + pages - 1u], r->map.flags))
+			return AMDVM_NPT_INVALID;
 	}
 	return amdvm_npt_validate_4k_mapping(npt, AMDVM_VCPU_RESET_ROM_GPA,
 	    reset_pa, AMDVM_NPT_READ | AMDVM_NPT_EXECUTE);

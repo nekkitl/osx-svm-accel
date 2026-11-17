@@ -6,6 +6,7 @@
 #include "amdvm_vmcb.h"
 #include "amdvm_physmem.h"
 #include "amdvm_vmrun_asm.h"
+#include "../amdvm_probe_abi.h"
 
 typedef struct amdvm_guest_gprs {
 	uint64_t rax; /* VMRUN exchanges RAX through the VMCB. */
@@ -34,8 +35,23 @@ typedef struct amdvm_vmexit_snapshot {
 	uint64_t guest_rip;
 	uint64_t guest_rflags;
 	uint64_t next_rip;
+	uint64_t event_injection;
+	uint64_t exit_int_info;
+	uint64_t tlb_control;
+	uint64_t clean_bits;
+	uint32_t guest_interruptibility;
+	uint32_t exit_int_info_error;
 	uint8_t instruction_length;
 	uint8_t instruction_bytes[AMDVM_VMCB_DECODE_ASSIST_MAX];
+#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+	/* Optional diagnostic buckets; they are not part of the user ABI. */
+	uint64_t memory_type_check_ticks;
+	uint64_t owner_acquire_ticks;
+	uint64_t vmcb_prepare_ticks;
+	uint64_t vmrun_xstate_ticks;
+	uint64_t owner_release_ticks;
+	uint64_t vmrun_samples;
+#endif
 } amdvm_vmexit_snapshot_t;
 
 typedef enum amdvm_vmrun_status {
@@ -45,8 +61,66 @@ typedef enum amdvm_vmrun_status {
 	AMDVM_VMRUN_XSTATE_UNSUPPORTED = -3,
 	AMDVM_VMRUN_SPECULATION_UNSUPPORTED = -4,
 	AMDVM_VMRUN_ENTRY_GATED = -5,
-	AMDVM_VMRUN_FPU_NOT_READY = -6
+	AMDVM_VMRUN_FPU_NOT_READY = -6,
+	AMDVM_VMRUN_HARDWARE_INVALID = -7,
+	AMDVM_VMRUN_NO_EXIT = -8
 } amdvm_vmrun_status_t;
+
+static inline uint32_t
+amdvm_vmrun_snapshot_read_u32(const amdvm_vmcb_t *vmcb, uint32_t offset)
+{
+	const uint8_t *p = &vmcb->bytes[offset];
+	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+	    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* Capture hardware-owned exit fields before the caller restores VMCB controls. */
+static inline void
+amdvm_vmexit_snapshot_capture(const amdvm_vmcb_t *vmcb,
+	amdvm_vmexit_snapshot_t *snapshot)
+{
+	snapshot->code = amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_EXIT_CODE);
+	snapshot->info1 = amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_EXIT_INFO1);
+	snapshot->info2 = amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_EXIT_INFO2);
+	snapshot->next_rip = amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_NEXT_RIP);
+	snapshot->guest_rip = amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_GUEST_RIP);
+	snapshot->guest_rflags = amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_GUEST_RFLAGS);
+	snapshot->event_injection = amdvm_vmcb_get_u64(vmcb,
+	    AMDVM_VMCB_EVENT_INJECTION);
+	snapshot->exit_int_info = (uint32_t)amdvm_vmcb_get_u64(vmcb,
+	    AMDVM_VMCB_EXIT_INT_INFO);
+	snapshot->exit_int_info_error = amdvm_vmrun_snapshot_read_u32(vmcb,
+	    AMDVM_VMCB_EXIT_INT_INFO_ERROR);
+	snapshot->tlb_control = amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_TLB_CONTROL);
+	snapshot->clean_bits = amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_CLEAN_BITS);
+	snapshot->guest_interruptibility =
+	    (amdvm_vmrun_snapshot_read_u32(vmcb, AMDVM_VMCB_INTERRUPT_STATE) &
+	    AMDVM_VMCB_INTERRUPT_SHADOW) ?
+	    AMDVM_X86_INTERRUPTIBILITY_STI_SHADOW : 0;
+	if (amdvm_vmrun_snapshot_read_u32(vmcb,
+	    AMDVM_VMCB_INTERCEPT_MISC1) & AMDVM_SVM_INTERCEPT_IRET) {
+		snapshot->guest_interruptibility |=
+		    AMDVM_X86_INTERRUPTIBILITY_NMI_BLOCKED;
+	}
+	snapshot->instruction_length =
+	    vmcb->bytes[AMDVM_VMCB_DECODE_ASSIST_LENGTH];
+	for (size_t i = 0; i < AMDVM_VMCB_DECODE_ASSIST_MAX; ++i) {
+		snapshot->instruction_bytes[i] =
+		    vmcb->bytes[AMDVM_VMCB_DECODE_ASSIST_BYTES + i];
+	}
+}
+
+static inline amdvm_vmrun_status_t
+amdvm_vmrun_status_for_exit(amdvm_vmrun_status_t asm_status,
+	uint64_t exit_code)
+{
+	if (asm_status != AMDVM_VMRUN_SUCCESS) return asm_status;
+	if (exit_code == AMDVM_SVM_EXIT_INVALID)
+		return AMDVM_VMRUN_HARDWARE_INVALID;
+	if (exit_code == AMDVM_SVM_EXIT_NOT_RUN)
+		return AMDVM_VMRUN_NO_EXIT;
+	return AMDVM_VMRUN_SUCCESS;
+}
 
 _Static_assert(offsetof(amdvm_guest_gprs_t, rax) == 0, "GPR ABI rax");
 _Static_assert(offsetof(amdvm_guest_gprs_t, rbx) == 8, "GPR ABI rbx");
@@ -64,7 +138,13 @@ _Static_assert(offsetof(amdvm_guest_gprs_t, r13) == 96, "GPR ABI r13");
 _Static_assert(offsetof(amdvm_guest_gprs_t, r14) == 104, "GPR ABI r14");
 _Static_assert(offsetof(amdvm_guest_gprs_t, r15) == 112, "GPR ABI r15");
 _Static_assert(sizeof(amdvm_guest_gprs_t) == 120, "GPR ABI size");
-_Static_assert(sizeof(amdvm_vmexit_snapshot_t) == 64, "VMEXIT snapshot ABI size");
+#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+_Static_assert(sizeof(amdvm_vmexit_snapshot_t) == 152,
+	"timed VMEXIT snapshot layout");
+#else
+_Static_assert(sizeof(amdvm_vmexit_snapshot_t) == 104,
+	"VMEXIT snapshot ABI size");
+#endif
 _Static_assert(AMDVM_VMRUN_VMCB_GUEST_RAX_OFFSET == AMDVM_VMCB_GUEST_RAX,
 	"assembly VMCB RAX offset");
 _Static_assert(AMDVM_VMRUN_FRAME_TEMP_RDX + sizeof(uint64_t) <=
@@ -92,9 +172,10 @@ _Static_assert((AMDVM_VMRUN_FRAME_SIZE & 15u) == 0,
  * One bounded entry/exit wrapper. Caller must own SVM on the current CPU and
  * invoke this only from the synchronous administrator-only userclient thread
  * while a supported IOSimpleLock pins the CPU and local interrupts are
- * disabled. Before entry, use amdvm_vmrun_xstate_capture_current_thread() on
- * this thread so XNU's normal #NM path restores its PCB state; do not clear
- * CR0.TS directly. This is a fixed-HLT experiment, not a general guest runner.
+ * disabled. Ensure XNU's ordinary #NM path has restored the thread if CR0.TS
+ * was set; do not clear CR0.TS directly. This wrapper captures host XSTATE at
+ * the last C boundary before VMRUN. This is a fixed-HLT experiment, not a
+ * general guest runner.
  * XNU does not
  * export its KDP watchpoint state, so operators must not invoke the experiment
  * while a kernel debugger or KDP hardware watchpoints are active. Caller also

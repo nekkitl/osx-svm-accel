@@ -1,15 +1,15 @@
 --- reference/accel/amdsvm/amdsvm.c
 +++ publication/accel/amdsvm/amdsvm.c
-@@ -147,7 +147,7 @@
+@@ -399,7 +399,7 @@
      bool confirm_unbounded_vmrun;
      bool confirm_finite_kick_test;
      bool confirm_finite_smp_test;
 -    bool confirm_alpine_smp;
 +    bool confirm_experimental_run;
      bool finite_host_tlb_stress;
-     bool trace_vmexit;
-     bool diagnostic_only;
-@@ -389,21 +389,21 @@
+     bool perf_stats;
+     AMDVMPerfStats *perf_stats_data;
+@@ -905,21 +905,21 @@
      s->confirm_finite_smp_test = value;
  }
  
@@ -37,18 +37,9 @@
  }
  
  static bool amdsvm_get_finite_host_tlb_stress(Object *obj, Error **errp)
-@@ -557,7 +557,7 @@
-     return true;
- }
- 
--/* Permit the pre-Alpine hardware stop experiment only with this exact ROM. */
-+/* Permit the early hardware stop experiment only with this exact ROM. */
- static bool amdsvm_finite_kick_rom_matches(const uint8_t *reset_page)
- {
-     static const uint8_t payload_prefix[] = {
-@@ -3347,16 +3347,19 @@
- 
-     AMDVMAccelState *state = (AMDVMAccelState *)accel;
+@@ -5263,16 +5263,19 @@
+             amdsvm_perf_vm_state_change, state);
+     }
  
 -    /* Explicit two-vCPU Alpine profile. 256 MiB is the user's smaller
 -     * diagnostic configuration; retain the existing 4 GiB profile. */
@@ -60,40 +51,32 @@
 -         (machine->ram_size != UINT64_C(4) * 1024 * 1024 * 1024 &&
 -          machine->ram_size != UINT64_C(256) * 1024 * 1024))) {
 -        error_report("AMD-SVM Alpine SMP profile requires VM API, exactly 2 vCPUs, 256 MiB or 4 GiB, and no other RUN confirmation");
-+    /* Guest-independent experimental RUN. Selecting this profile enables
-+     * the VM-scoped API; resource choices remain bounded for this release. */
++    /* Keep the publication's guest-independent opt-in and a bounded
++     * resource envelope for this experimental build. */
 +    if (state->confirm_experimental_run) {
 +        state->vm_api = true;
 +    }
 +    if (state->confirm_experimental_run &&
 +        (state->diagnostic_only || state->confirm_finite_kick_test ||
 +         state->confirm_finite_smp_test || state->confirm_unbounded_vmrun ||
-+         machine->smp.cpus < 1 || machine->smp.cpus > 2 ||
++         machine->smp.cpus < 1 || machine->smp.cpus > 8 ||
 +         machine->smp.max_cpus != machine->smp.cpus ||
 +         machine->ram_size < UINT64_C(256) * 1024 * 1024 ||
-+         machine->ram_size > UINT64_C(4) * 1024 * 1024 * 1024)) {
-+        error_report("AMD-SVM experimental RUN supports 1..2 vCPUs, 256 MiB..4 GiB RAM, no CPU hotplug, and no other RUN confirmation");
++         machine->ram_size > UINT64_C(16) * 1024 * 1024 * 1024)) {
++        error_report("AMD-SVM experimental RUN supports 1..8 vCPUs, 256 MiB..16 GiB RAM, no CPU hotplug, and no other RUN confirmation");
          return -EINVAL;
      }
  
-@@ -3379,12 +3382,12 @@
-         error_report("AMD-SVM finite-SMP ROM validation is diagnostic-only and restricted to 2 vCPUs and exactly 4 GiB");
+@@ -5296,7 +5299,7 @@
          return -EINVAL;
      }
--    /* Diagnostic preparation is unrestricted by RUN policy. Generic SMP RUN
--     * is limited to the exact Alpine profile validated by the finite AP test. */
-+    /* Diagnostic preparation is unrestricted by RUN policy. Guest execution
-+     * requires explicit experimental RUN or the separate finite ROM profile. */
-     if (state->vm_api && !state->diagnostic_only &&
-         machine->smp.cpus > 1 && !state->confirm_finite_smp_test &&
--        !state->confirm_alpine_smp) {
--        error_report("AMD-SVM multi-vCPU execution requires the reviewed finite-SMP ROM profile or explicit 2-vCPU Alpine profile");
-+        !state->confirm_experimental_run) {
-+        error_report("AMD-SVM multi-vCPU execution requires the reviewed finite-SMP ROM profile or explicit experimental RUN profile");
-         return -ENOTSUP;
-     }
+     /* Multi-vCPU VM API RUN is allowed with the generic unbounded-VMRUN
+-     * confirmation; the exact finite/Alpine profiles keep their own checks. */
++     * confirmation; the finite and publication profiles keep their own checks. */
      /* CPU hotplug has no provider create/destroy hook yet. */
-@@ -3398,21 +3401,21 @@
+     if (state->vm_api && !state->diagnostic_only &&
+         machine->smp.max_cpus != machine->smp.cpus) {
+@@ -5308,21 +5311,21 @@
          ((state->diagnostic_only &&
            (!state->diagnostic_validate_ram_map ||
             state->confirm_unbounded_vmrun || state->confirm_finite_kick_test ||
@@ -120,7 +103,7 @@
           machine->smp.cpus < 1 ||
           machine->smp.cpus > AMDVM_VM_ABI_DRAFT_MAX_VCPUS ||
           machine->smp.max_cpus > AMDVM_VM_ABI_DRAFT_MAX_VCPUS ||
-@@ -3424,13 +3427,13 @@
+@@ -5334,13 +5337,13 @@
  
      if (state->trace_vmexit && !state->confirm_finite_kick_test &&
          !state->confirm_finite_smp_test &&
@@ -136,7 +119,7 @@
          state->confirm_unbounded_vmrun) {
          error_report("AMD-SVM finite-kick and unbounded VMRUN confirmations are mutually exclusive");
          return -EINVAL;
-@@ -3461,7 +3464,7 @@
+@@ -5371,7 +5374,7 @@
      if (strcmp(object_get_typename(OBJECT(machine)),
                 MACHINE_TYPE_NAME("none")) == 0) {
          if (state->confirm_finite_kick_test || state->confirm_finite_smp_test ||
@@ -145,7 +128,7 @@
              state->trace_vmexit) {
              error_report("AMD-SVM finite-kick mode requires the PC firmware path, not the fixed microguest path");
              IOServiceClose(connection);
-@@ -3483,7 +3486,7 @@
+@@ -5393,7 +5396,7 @@
      }
      if (!state->confirm_unbounded_vmrun &&
          !state->confirm_finite_kick_test &&
@@ -154,16 +137,7 @@
          !state->diagnostic_only) {
          error_report("AMD-SVM firmware execution is gated: use diagnostic-only=on, an exact finite test ROM, or the separately reviewed unbounded VMRUN confirmation");
          IOServiceClose(connection);
-@@ -3579,7 +3582,7 @@
- {
-     AccelClass *ac = ACCEL_CLASS(oc);
- 
--    ac->name = "AMD SVM provider (experimental QEMU firmware)";
-+    ac->name = "AMD SVM provider (experimental QEMU accelerator)";
-     ac->init_machine = amdsvm_init_machine;
-     ac->allowed = &amdsvm_allowed;
-     object_class_property_add_bool(oc, "confirm-no-kdp-watchpoints",
-@@ -3594,9 +3597,9 @@
+@@ -5618,9 +5621,9 @@
      object_class_property_add_bool(oc, "confirm-finite-smp-test",
                                     amdsvm_get_confirm_finite_smp_test,
                                     amdsvm_set_confirm_finite_smp_test);

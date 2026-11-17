@@ -24,7 +24,12 @@ tests = {
   'test-resv-mem': [],
   # all code tested by test-x86-topo is inside topology.h
   'test-x86-topo': [],
-  'test-amdsvm-memory-types': ['../../target/i386/amdsvm/amdsvm-memory-types.c'],
+  'test-amdsvm-memory-types': [
+    '../../target/i386/amdsvm/amdsvm-memory-types.c',
+    '../../target/i386/amdsvm/amdsvm-memory-map.c',
+  ],
+  'test-amdsvm-bql-policy': [],
+  'test-amdsvm-cr3-policy': [],
   'test-amdsvm-memory-map': [
     '../../target/i386/amdsvm/amdsvm-memory-map.c',
   ],

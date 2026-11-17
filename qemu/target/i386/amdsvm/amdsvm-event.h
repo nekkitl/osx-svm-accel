@@ -40,8 +40,13 @@ static inline int amdsvm_event_valid(uint32_t event_info, uint32_t error_code)
     if (type == AMDVM_VCPU_EVENTINJ_TYPE_NMI) {
         return vector == 2u && !error_valid && error_code == 0;
     }
-    return type == AMDVM_VCPU_EVENTINJ_TYPE_EXCEPTION &&
-           vector == AMDVM_VCPU_EXCEPTION_GP && error_valid && error_code == 0;
+    if (type != AMDVM_VCPU_EVENTINJ_TYPE_EXCEPTION || !error_valid) {
+        return 0;
+    }
+    if (vector == AMDVM_VCPU_EXCEPTION_GP) {
+        return error_code == 0;
+    }
+    return 0;
 }
 
 static inline int amdsvm_event_queue_exception(AMDVMEventState *state,
@@ -58,6 +63,33 @@ static inline int amdsvm_event_queue_exception(AMDVMEventState *state,
     state->exception_info = event_info;
     state->exception_error_code = error_code;
     return 0;
+}
+
+static inline int amdsvm_event_queue_page_fault(AMDVMEventState *state,
+                                                 uint32_t error_code)
+{
+    uint32_t event_info = AMDVM_VCPU_EVENTINJ_VALID |
+        AMDVM_VCPU_EVENTINJ_TYPE_EXCEPTION |
+        AMDVM_VCPU_EVENTINJ_ERROR_VALID | AMDVM_VCPU_EXCEPTION_PF;
+
+    /* This path is called only by the diagnostic PF-intercept handler. Keep
+     * generic exception injection strict so ordinary callers cannot queue a
+     * #PF without going through the gated diagnostic path. */
+    if (!state || state->exception_pending) {
+        return -1;
+    }
+    state->exception_pending = true;
+    state->exception_info = event_info;
+    state->exception_error_code = error_code;
+    return 0;
+}
+
+static inline bool amdsvm_pf_mapping_mismatch(uint32_t error_code,
+                                               bool guest_mapping_present)
+{
+    /* PFEC.P=0 claims a not-present translation. A completed guest page-table
+     * walk at the same stopped VMEXIT contradicts that claim. */
+    return !(error_code & 1u) && guest_mapping_present;
 }
 
 static inline int amdsvm_event_queue_nmi(AMDVMEventState *state)

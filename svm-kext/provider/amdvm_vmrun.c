@@ -338,26 +338,8 @@ amdvm_vmrun_once(const amdvm_physmem_region_t *backing_region,
 	    guest_gprs, host_xstate_area, guest_xstate_area, guest_execution_xcr0);
 	if (asm_status == AMDVM_VMRUN_SUCCESS) {
 		__sync_synchronize();
-		exit_snapshot->code = amdvm_vmcb_get_u64(guest_vmcb,
-		    AMDVM_VMCB_EXIT_CODE);
-		exit_snapshot->info1 = amdvm_vmcb_get_u64(guest_vmcb,
-		    AMDVM_VMCB_EXIT_INFO1);
-		exit_snapshot->info2 = amdvm_vmcb_get_u64(guest_vmcb,
-		    AMDVM_VMCB_EXIT_INFO2);
-		exit_snapshot->next_rip = amdvm_vmcb_get_u64(guest_vmcb,
-		    AMDVM_VMCB_NEXT_RIP);
-		exit_snapshot->guest_rip = amdvm_vmcb_get_u64(guest_vmcb,
-		    AMDVM_VMCB_GUEST_RIP);
-		exit_snapshot->guest_rflags = amdvm_vmcb_get_u64(guest_vmcb,
-		    AMDVM_VMCB_GUEST_RFLAGS);
-		exit_snapshot->instruction_length =
-		    guest_vmcb->bytes[AMDVM_VMCB_DECODE_ASSIST_LENGTH];
-		for (size_t decodeIndex = 0;
-		    decodeIndex < AMDVM_VMCB_DECODE_ASSIST_MAX; ++decodeIndex) {
-			exit_snapshot->instruction_bytes[decodeIndex] =
-			    guest_vmcb->bytes[AMDVM_VMCB_DECODE_ASSIST_BYTES +
-			    decodeIndex];
-		}
+		amdvm_vmexit_snapshot_capture(guest_vmcb, exit_snapshot);
 	}
-	return (amdvm_vmrun_status_t)asm_status;
+	return amdvm_vmrun_status_for_exit((amdvm_vmrun_status_t)asm_status,
+	    exit_snapshot->code);
 }

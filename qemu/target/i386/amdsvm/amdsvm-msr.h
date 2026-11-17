@@ -283,6 +283,7 @@ static inline bool amdsvm_msr_decode_mtrr(uint32_t msr,
 static inline bool amdsvm_msr_is_tcg_compat_amd(uint32_t msr)
 {
     return (msr >= 0xc0010000u && msr <= 0xc0010003u) ||
+           msr == 0x3au ||
            msr == 0xc0010007u || msr == 0xc0010010u ||
            msr == 0xc0010015u || msr == 0xc0010055u ||
            msr == 0xc0010114u || msr == 0xc0011029u;

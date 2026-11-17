@@ -14,7 +14,7 @@ Use QMP `stop` and verify `query-status` reports `paused` before controlled tear
 
 ## Compatibility and resources
 
-- Public RUN policy: 1–2 vCPUs, 256 MiB–4 GiB, no CPU hotplug. RAM pinning can still fail because of host resources or unsupported memory types.
+- Public RUN policy: 1–8 vCPUs, 256 MiB–16 GiB, no CPU hotplug. RAM pinning can still fail because of host resources or unsupported memory types.
 - BIOS PC is the reference machine profile. Other firmware, devices and guest OSes may encounter unsupported instructions, MSRs, MMIO or interrupt paths.
 - Short two-core tests have passed. Long stability tests and performance characterization have not been completed. See [matrix](hardware.md).
 - macOS kernel-export dependencies can change across releases. Local export list edits do not add symbols to the running kernel; verify actual loading.

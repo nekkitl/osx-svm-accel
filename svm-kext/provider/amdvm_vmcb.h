@@ -19,6 +19,9 @@
 #define AMDVM_VMCB_IOPM_PA               0x040u
 #define AMDVM_VMCB_MSRPM_PA              0x048u
 #define AMDVM_VMCB_TLB_CONTROL          0x058u
+#define AMDVM_VMCB_ASID                 AMDVM_VMCB_TLB_CONTROL
+#define AMDVM_VMCB_TLB_CONTROL_COMMAND (AMDVM_VMCB_TLB_CONTROL + 4u)
+#define AMDVM_VMCB_TSC_OFFSET            0x050u
 #define AMDVM_VMCB_INTERRUPT_CONTROL    0x060u
 #define AMDVM_VMCB_INTERRUPT_STATE      0x068u
 #define AMDVM_VMCB_EXIT_CODE            0x070u
@@ -35,6 +38,22 @@
 #define AMDVM_VMCB_NPT_ROOT              0x0b0u
 #define AMDVM_VMCB_EVENT_INJECTION       0x0a8u
 #define AMDVM_VMCB_CLEAN_BITS            0x0c0u
+#define AMDVM_VMCB_CLEAN_INTERCEPTS       (1u << 0)
+#define AMDVM_VMCB_CLEAN_IOPM             (1u << 1)
+#define AMDVM_VMCB_CLEAN_ASID             (1u << 2)
+#define AMDVM_VMCB_CLEAN_INTR             (1u << 3)
+#define AMDVM_VMCB_CLEAN_NPT              (1u << 4)
+#define AMDVM_VMCB_CLEAN_CR               (1u << 5)
+#define AMDVM_VMCB_CLEAN_DR               (1u << 6)
+#define AMDVM_VMCB_CLEAN_DT               (1u << 7)
+#define AMDVM_VMCB_CLEAN_SEG              (1u << 8)
+#define AMDVM_VMCB_CLEAN_CR2              (1u << 9)
+#define AMDVM_VMCB_CLEAN_LBR              (1u << 10)
+#define AMDVM_VMCB_CLEAN_AVIC             (1u << 11)
+#define AMDVM_VMCB_CLEAN_CET              (1u << 12)
+/* RUN currently rewrites every other cached group. */
+#define AMDVM_VMCB_CLEAN_STABLE_RUN_MASK \
+	(AMDVM_VMCB_CLEAN_IOPM | AMDVM_VMCB_CLEAN_ASID)
 #define AMDVM_VMCB_GUEST_STATE            0x400u
 #define AMDVM_VMCB_GUEST_ES               0x400u
 #define AMDVM_VMCB_GUEST_CS               0x410u
@@ -108,11 +127,17 @@
 #define AMDVM_SVM_INTERCEPT_EFER_WRITE_TRAP (1u << 15) /* misc2 */
 #define AMDVM_SVM_EXIT_HLT                0x78u
 #define AMDVM_SVM_EXIT_CPUID              0x72u
-#define AMDVM_SVM_EXIT_NOT_RUN            UINT64_MAX - 1u
+#define AMDVM_SVM_EXIT_INVALID             UINT64_C(0xffffffff)
+#define AMDVM_SVM_EXIT_ERR                 UINT64_MAX
+#define AMDVM_SVM_EXIT_NOT_RUN             (UINT64_MAX - 1u)
 #define AMDVM_SVM_EXIT_NPF                0x400u
 #define AMDVM_VMCB_INTERRUPT_SHADOW       (1ull << 0)
 #define AMDVM_VMCB_V_INTR_MASKING         (1u << 24)
 #define AMDVM_SVM_TLB_FLUSH_ALL           1u
+#define AMDVM_VMCB_CR2_INDEX              2u
+#define AMDVM_SVM_EXIT_WRITE_CR0          0x010u
+#define AMDVM_SVM_EXIT_WRITE_CR3          0x013u
+#define AMDVM_SVM_EXIT_WRITE_CR4          0x014u
 #define AMDVM_VMCB_NPT_ENABLE             1u
 
 typedef struct amdvm_vmcb {
@@ -143,11 +168,16 @@ void amdvm_vmcb_set_u16(amdvm_vmcb_t *vmcb, uint32_t offset, uint16_t value);
 void amdvm_vmcb_set_u32(amdvm_vmcb_t *vmcb, uint32_t offset, uint32_t value);
 void amdvm_vmcb_set_u64(amdvm_vmcb_t *vmcb, uint32_t offset, uint64_t value);
 uint64_t amdvm_vmcb_get_u64(const amdvm_vmcb_t *vmcb, uint32_t offset);
+/* Force VMRUN to reload all guest state from this VMCB, ignoring cached state. */
+void amdvm_vmcb_clear_clean_bits(amdvm_vmcb_t *vmcb);
 /* Stock-XNU stop handling depends on host interrupts forcing a VMEXIT. */
 int amdvm_vmcb_external_interrupt_exit_enabled(const amdvm_vmcb_t *vmcb);
-/* Accept external interrupts, NMI, and #GP with its mandatory zero error code. */
+/* Accept the supported event-injection forms used by normal emulation. */
 int amdvm_vmcb_validate_event_injection(uint32_t event_injection,
 	uint32_t error_code);
+/* Diagnostic #PF reinjection is permitted only with the PF-intercept gate. */
+int amdvm_vmcb_validate_event_injection_diagnostic_pf(
+	uint32_t event_injection, uint32_t error_code);
 struct amdvm_x86_guest_state_v1;
 /* Validate architectural invariants before any VMCB or SVM state changes. */
 int amdvm_vmcb_validate_x86_state_v1(
@@ -155,6 +185,13 @@ int amdvm_vmcb_validate_x86_state_v1(
 int amdvm_vmcb_load_x86_state_v1(amdvm_vmcb_t *vmcb,
 	const struct amdvm_x86_guest_state_v1 *state, uint64_t gprs[15],
 	void *guest_xstate, size_t guest_xstate_size);
+/* Caller has already passed amdvm_vmcb_validate_x86_state_v1(state). */
+int amdvm_vmcb_load_x86_state_v1_validated(amdvm_vmcb_t *vmcb,
+	const struct amdvm_x86_guest_state_v1 *state, uint64_t gprs[15],
+	void *guest_xstate, size_t guest_xstate_size);
+/* Cached state groups whose current VMCB contents equal the next input. */
+uint32_t amdvm_vmcb_state_clean_candidates(const amdvm_vmcb_t *vmcb,
+	const struct amdvm_x86_guest_state_v1 *state);
 /* Temporarily single-step through an intercepted NMI-handler IRET. */
 int amdvm_vmcb_arm_nmi_iret_step(amdvm_vmcb_t *vmcb,
 	const struct amdvm_x86_guest_state_v1 *state,
@@ -162,10 +199,30 @@ int amdvm_vmcb_arm_nmi_iret_step(amdvm_vmcb_t *vmcb,
 void amdvm_vmcb_finish_nmi_iret_step(amdvm_vmcb_t *vmcb,
 	uint32_t saved_exception_intercepts, uint64_t original_rflags,
 	struct amdvm_x86_guest_state_v1 *result_state);
+/* Temporarily add diagnostic exception intercepts and restore the exact mask. */
+int amdvm_vmcb_add_exception_intercepts(amdvm_vmcb_t *vmcb, uint32_t mask,
+	uint32_t *saved_exception_intercepts);
+void amdvm_vmcb_restore_exception_intercepts(amdvm_vmcb_t *vmcb,
+	uint32_t saved_exception_intercepts);
 /* Shared production/offline path for staging one QEMU RUN request. */
 int amdvm_vmcb_stage_run_request(amdvm_vmcb_t *vmcb, uint64_t gprs[15],
 	void *guest_xstate, const struct amdvm_vcpu_run_request *request,
 	int full_state);
+/* Temporarily allow native RDTSC with a QEMU-synchronized TSC offset. */
+int amdvm_vmcb_prepare_native_rdtsc(amdvm_vmcb_t *vmcb, uint64_t tsc_offset,
+	uint32_t *saved_misc1);
+void amdvm_vmcb_restore_rdtsc_intercept(amdvm_vmcb_t *vmcb,
+	uint32_t saved_misc1);
+/* Temporarily allow native MOV-from-CR2 for one VMRUN. */
+int amdvm_vmcb_prepare_native_cr2_read(amdvm_vmcb_t *vmcb,
+	uint16_t *saved_cr_read);
+void amdvm_vmcb_restore_cr2_read_intercept(amdvm_vmcb_t *vmcb,
+	uint16_t saved_cr_read);
+/* Temporarily allow native CR3 reads and writes for one VMRUN. */
+int amdvm_vmcb_prepare_native_cr3(amdvm_vmcb_t *vmcb,
+	uint16_t *saved_cr_read, uint16_t *saved_cr_write);
+void amdvm_vmcb_restore_native_cr3(amdvm_vmcb_t *vmcb,
+	uint16_t saved_cr_read, uint16_t saved_cr_write);
 int amdvm_vmcb_capture_entry_snapshot(const amdvm_vmcb_t *vmcb,
 	const struct amdvm_npt *npt, uint64_t guest_gpa_page,
 	size_t entry_offset,

@@ -4,7 +4,13 @@ Reference host: Ryzen 7 5700X (8 cores / 16 logical CPUs), macOS Tahoe 26.0.1, b
 
 Recorded host memory controls: SYSCFG `0x740000`, TOP_MEM `0xd0000000`, TOP_MEM2 `0x830000000`; 8 variable MTRRs (4 active), 48 physical address bits. These describe this host, not universal settings to write on another machine.
 
-## Matrix
+## November snapshot
+
+The [October 18–30 evidence](../../evidence/reference-2026-11-17/README.md) records Alpine timings, clean QMP stop/quit where observed, and the early Linux page fault on later builds. This snapshot packages the October 30 diagnostic candidate, which has only been built offline.
+
+**Windows 10 22H2:** full installation and boot to desktop recorded on the reference host. The Oct 25 boot used Q35, OVMF, 8 vCPUs and 4 GiB, and QMP stop/quit succeeded. See the [Windows run record](../../evidence/reference-2026-11-17/README.md#windows-10).
+
+## Original October 14 matrix
 
 | Scenario | Result and scope |
 | --- | --- |
@@ -19,9 +25,9 @@ Recorded host memory controls: SYSCFG `0x740000`, TOP_MEM `0xd0000000`, TOP_MEM2
 | Fixed SVM SMP run stop + poweroff + quit | paused in 1.626 ms; recorded SVM MSRs restored across 16 CPUs, quarantine zero |
 | 4 guest cores / 8 GiB, other guest OSes, migration/hotplug | not established |
 
-The latest SMP test used `pc`, one socket, two cores, one thread per core, VirtIO block/network/GPU, 1280×800 display and SLIRP NAT. Guest kernel: `6.18.55-0-virt`; an earlier session used `6.18.52-0-virt`. No additional guest kernel arguments were injected. See [reference evidence](../../evidence/reference-2026-10-14/README.md).
+The October 14 SMP test used `pc`, one socket, two cores, one thread per core, VirtIO block/network/GPU, 1280×800 display and SLIRP NAT. Guest kernel: `6.18.55-0-virt`; an earlier session used `6.18.52-0-virt`. No additional guest kernel arguments were injected. See [reference evidence](../../evidence/reference-2026-10-14/README.md).
 
-The publication frontend accepts 1–2 vCPUs and 256 MiB–4 GiB. This is an admission policy, not verification of every configuration. The provider's internal 64-slot ABI capacity is not a demonstrated 64-vCPU guest capability. The generic frontend differs from the recorded hardware binary in its public RUN profile and resource admission. Its build/offline checks are recorded separately in [MANIFEST.json](../../MANIFEST.json).
+The public frontend accepts 1–8 vCPUs and 256 MiB–16 GiB. The runtime record covers individual build pairs and guest profiles. See the [release manifest](../../MANIFEST.json) for candidate identities.
 
 ## Hardware reports
 

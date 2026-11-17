@@ -8,6 +8,7 @@
 #include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "qemu/main-loop.h"
+#include "qemu/timer.h"
 #include "hw/core/cpu.h"
 #include "hw/i386/apic.h"
 #include "system/address-spaces.h"
@@ -15,11 +16,15 @@
 #include "system/memory-internal.h"
 #include "qemu/rcu.h"
 #include "../cpu.h"
+#include "../host-cpu.h"
 #include "../svm.h"
 #include "emulate/x86_emu.h"
 #include "emulate/x86_decode.h"
 #include "amdsvm-state.h"
 #include "amdsvm-msr.h"
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 
 #define AMDVM_EFER_SVME (1ull << 12)
 #define AMDVM_XSTATE_BV_OFFSET 512u
@@ -27,17 +32,43 @@
 #define AMDVM_XSTATE_RESERVED_OFFSET 528u
 #define AMDVM_XSTATE_RESERVED_SIZE 48u
 #define AMDSVM_NPF_ROM_MOVSB_BATCH_MAX 64u
-#define AMDSVM_IOIO_STRING_BATCH_MAX 64u
+#define AMDSVM_IOIO_STRING_BATCH_MAX 4096u
 #define AMDSVM_VGA_STOS_BATCH_MAX 64u
 #define AMDSVM_VGA_APERTURE_START UINT64_C(0x000a0000)
 #define AMDSVM_VGA_APERTURE_END   UINT64_C(0x000c0000)
 
 static bool amdsvm_emulator_initialized;
 static bool amdsvm_emulator_io_failed;
+static uint32_t amdsvm_wire_state_abi = AMDVM_X86_STATE_ABI_VERSION_V2;
+
+int amdsvm_state_set_abi_version(uint32_t abi_version)
+{
+    if (abi_version != AMDVM_X86_STATE_ABI_VERSION_V2 &&
+        abi_version != AMDVM_X86_STATE_ABI_VERSION_V3) {
+        return -EINVAL;
+    }
+    amdsvm_wire_state_abi = abi_version;
+    return 0;
+}
+
+uint32_t amdsvm_state_get_abi_version(void)
+{
+    return amdsvm_wire_state_abi;
+}
 
 uint32_t amdsvm_state_apic_id(CPUState *cpu)
 {
     return X86_CPU(cpu)->apic_id;
+}
+
+uint32_t amdsvm_state_phys_bits(CPUState *cpu)
+{
+    return X86_CPU(cpu)->phys_bits;
+}
+
+uint32_t amdsvm_state_host_phys_bits(void)
+{
+    return host_cpu_phys_bits();
 }
 
 void amdsvm_state_alloc_emulator_buffer(CPUState *cs)
@@ -78,9 +109,10 @@ static X86Seg amdsvm_modrm_default_segment(const struct x86_decode *decode)
 
 static unsigned amdsvm_operand_size(CPUX86State *env, bool override)
 {
-    bool code32 = (env->cr[0] & 1u) != 0 &&
+    bool code32 = (env->hflags & HF_CS64_MASK) != 0 ||
+                  ((env->cr[0] & 1u) != 0 &&
                   (env->eflags & (1u << 17)) == 0 &&
-                  (env->segs[R_CS].flags & DESC_B_MASK) != 0;
+                  (env->segs[R_CS].flags & DESC_B_MASK) != 0);
     unsigned size = code32 ? 4u : 2u;
 
     return override ? (size == 4u ? 2u : 4u) : size;
@@ -151,6 +183,19 @@ static bool amdsvm_emulator_is_user_mode(CPUState *cs)
 
 static void amdsvm_msr_gp(CPUX86State *env)
 {
+    static unsigned diagnostic_logs;
+
+    if (diagnostic_logs < 256) {
+        error_report("AMDVM_MSR_GP index=%u msr=0x%x rip=0x%llx cs=%04x "
+                     "cs_base=0x%llx cr0=0x%llx rax=0x%llx rdx=0x%llx",
+                     diagnostic_logs++, (uint32_t)env->regs[R_ECX],
+                     (unsigned long long)env->eip,
+                     env->segs[R_CS].selector,
+                     (unsigned long long)env->segs[R_CS].base,
+                     (unsigned long long)env->cr[0],
+                     (unsigned long long)env->regs[R_EAX],
+                     (unsigned long long)env->regs[R_EDX]);
+    }
     x86_emul_raise_exception(env, EXCP0D_GPF, 0);
 }
 
@@ -160,6 +205,17 @@ static bool amdsvm_msr_read(CPUState *cs)
     uint32_t msr = (uint32_t)env->regs[R_ECX];
     uint64_t value;
     AMDVMMTRRRegister mtrr;
+    static unsigned tsc_read_logs;
+
+    if (msr == MSR_IA32_TSC && tsc_read_logs < 32) {
+        error_report("AMDVM_TSC_RD n=%u rip=0x%llx cs=%04x cs_base=0x%llx cr0=0x%llx tsc_offset=0x%llx",
+                     tsc_read_logs, (unsigned long long)env->eip,
+                     env->segs[R_CS].selector,
+                     (unsigned long long)env->segs[R_CS].base,
+                     (unsigned long long)env->cr[0],
+                     (unsigned long long)env->tsc_offset);
+        tsc_read_logs++;
+    }
 
     if (amdsvm_msr_decode_mtrr(msr, &mtrr)) {
         switch (mtrr.kind) {
@@ -198,6 +254,10 @@ static bool amdsvm_msr_read(CPUState *cs)
     case MSR_IA32_SYSENTER_EIP: value = env->sysenter_eip; break;
     case MSR_EFER: value = env->efer; break;
     case MSR_PAT: value = env->pat; break;
+    case MSR_IA32_TSC:
+        value = cpu_get_tsc(env) + env->tsc_offset;
+        break;
+    case MSR_TSC_AUX: value = env->tsc_aux; break;
     case MSR_IA32_UCODE_REV: value = X86_CPU(cs)->ucode_rev; break;
     case MSR_STAR: value = env->star; break;
 #ifdef TARGET_X86_64
@@ -216,8 +276,11 @@ static bool amdsvm_msr_read(CPUState *cs)
         value = cpu_get_apic_base(X86_CPU(cs)->apic_state);
         break;
     default:
-        amdsvm_msr_gp(env);
-        return true;
+        /* Keep the accelerated path consistent with QEMU TCG.  Its RDMSR
+         * helper returns zero for unimplemented MSRs (including firmware
+         * probes), rather than raising #GP. */
+        value = 0;
+        break;
     }
 
 read_value:
@@ -250,44 +313,68 @@ static bool amdsvm_npf_targets_vga_mmio(uint64_t exit_info1,
            width <= AMDSVM_VGA_APERTURE_END - gpa;
 }
 
-static bool amdsvm_npf_targets_unassigned(uint64_t exit_info1,
-                                          uint64_t gpa, unsigned width)
+typedef enum AMDVMNPFMemoryType {
+    AMDVM_NPF_MEMORY_INVALID,
+    AMDVM_NPF_MEMORY_UNASSIGNED,
+    AMDVM_NPF_MEMORY_RAM,
+    AMDVM_NPF_MEMORY_ROM,
+    AMDVM_NPF_MEMORY_MMIO,
+} AMDVMNPFMemoryType;
+
+static AMDVMNPFMemoryType amdsvm_npf_classify_memory(uint64_t gpa,
+                                                     unsigned width,
+                                                     bool is_write)
 {
     MemoryRegion *mr;
     hwaddr xlat, len = width;
 
-    if (exit_info1 != ((UINT64_C(1) << 32) | 6u) || width == 0) {
-        return false;
-    }
-
-    RCU_READ_LOCK_GUARD();
-    mr = address_space_translate(&address_space_memory, gpa, &xlat, &len,
-                                 true, MEMTXATTRS_UNSPECIFIED);
-    return mr && len >= width && mr->ops == &unassigned_mem_ops;
-}
-
-static bool amdsvm_npf_targets_ram(uint64_t gpa, unsigned width,
-                                   bool is_write)
-{
-    MemoryRegion *mr;
-    hwaddr xlat, len = width;
-
-    if (width == 0) {
-        return false;
+    if (width == 0 || gpa > UINT64_MAX - width) {
+        return AMDVM_NPF_MEMORY_INVALID;
     }
 
     RCU_READ_LOCK_GUARD();
     mr = address_space_translate(&address_space_memory, gpa, &xlat, &len,
                                  is_write, MEMTXATTRS_UNSPECIFIED);
-    return mr && len >= width && memory_region_is_ram(mr) &&
-           !memory_region_is_rom(mr);
+    if (!mr || len < width) {
+        return AMDVM_NPF_MEMORY_INVALID;
+    }
+    if (mr->ops == &unassigned_mem_ops) {
+        return AMDVM_NPF_MEMORY_UNASSIGNED;
+    }
+    if (memory_region_is_rom(mr)) {
+        return AMDVM_NPF_MEMORY_ROM;
+    }
+    if (memory_region_is_ram(mr)) {
+        return AMDVM_NPF_MEMORY_RAM;
+    }
+    if (mr->ops) {
+        return AMDVM_NPF_MEMORY_MMIO;
+    }
+    return AMDVM_NPF_MEMORY_INVALID;
+}
+
+static bool amdsvm_npf_targets_unassigned(uint64_t exit_info1,
+                                          uint64_t gpa, unsigned width,
+                                          bool is_write)
+{
+    uint64_t expected_info1 = (UINT64_C(1) << 32) |
+                              (is_write ? 6u : 4u);
+
+    return exit_info1 == expected_info1 &&
+           amdsvm_npf_classify_memory(gpa, width, is_write) ==
+               AMDVM_NPF_MEMORY_UNASSIGNED;
+}
+
+static bool amdsvm_npf_targets_ram(uint64_t gpa, unsigned width,
+                                   bool is_write)
+{
+    return amdsvm_npf_classify_memory(gpa, width, is_write) ==
+           AMDVM_NPF_MEMORY_RAM;
 }
 
 static bool amdsvm_npf_targets_mmio(uint64_t exit_info1, uint64_t gpa,
                                     unsigned width, bool is_write)
 {
-    MemoryRegion *mr;
-    hwaddr xlat, len = width;
     uint64_t expected_info1 = (UINT64_C(1) << 32) |
                               (is_write ? 6u : 4u);
 
@@ -295,29 +382,19 @@ static bool amdsvm_npf_targets_mmio(uint64_t exit_info1, uint64_t gpa,
         return false;
     }
 
-    RCU_READ_LOCK_GUARD();
-    mr = address_space_translate(&address_space_memory, gpa, &xlat, &len,
-                                 is_write, MEMTXATTRS_UNSPECIFIED);
-    return mr && len >= width && mr->ops &&
-           !memory_region_is_ram(mr) && !memory_region_is_rom(mr) &&
-           mr->ops != &unassigned_mem_ops;
+    return amdsvm_npf_classify_memory(gpa, width, is_write) ==
+           AMDVM_NPF_MEMORY_MMIO;
 }
 
-static bool amdsvm_npf_targets_vga_rom_read(uint64_t exit_info1,
-                                            uint64_t gpa, unsigned width)
+static bool amdsvm_npf_targets_readonly_rom(uint64_t exit_info1,
+                                           uint64_t gpa, unsigned width)
 {
-    MemoryRegion *mr;
-    hwaddr xlat, len = width;
-
     if (exit_info1 != ((UINT64_C(1) << 32) | 4u) || width == 0) {
         return false;
     }
 
-    RCU_READ_LOCK_GUARD();
-    mr = address_space_translate(&address_space_memory, gpa, &xlat, &len,
-                                 false, MEMTXATTRS_UNSPECIFIED);
-    return mr && len >= width && memory_region_is_rom(mr) &&
-           strcmp(memory_region_name(mr), "vga.rom") == 0;
+    return amdsvm_npf_classify_memory(gpa, width, false) ==
+           AMDVM_NPF_MEMORY_ROM;
 }
 
 static int amdsvm_emulate_mmio_memory_write(CPUX86State *env,
@@ -326,10 +403,161 @@ static int amdsvm_emulate_mmio_memory_write(CPUX86State *env,
 {
     target_ulong original_rip = env->eip;
 
+    /*
+     * vCPU threads release the BQL only while inside provider RUN. A sibling
+     * that exits for MMIO must reacquire the BQL before it can call a QEMU
+     * MemoryRegion callback, so this whole instruction (including an RMW
+     * read followed by its write) is serialized against sibling callbacks.
+     */
+    g_assert(bql_locked());
     exec_instruction(env, decode);
     if (env->eip != original_rip + decode->len) {
         error_setg(errp, "AMD-SVM MMIO write emulation did not complete");
         return -EIO;
+    }
+    return 0;
+}
+
+static bool amdsvm_mmio_rmw_cmd(enum x86_decode_cmd cmd)
+{
+    /* These commands have QEMU interpreter handlers that write operand 0. */
+    switch (cmd) {
+    case X86_DECODE_CMD_ADD:
+    case X86_DECODE_CMD_OR:
+    case X86_DECODE_CMD_ADC:
+    case X86_DECODE_CMD_SBB:
+    case X86_DECODE_CMD_AND:
+    case X86_DECODE_CMD_SUB:
+    case X86_DECODE_CMD_XOR:
+    case X86_DECODE_CMD_INC:
+    case X86_DECODE_CMD_DEC:
+    case X86_DECODE_CMD_NOT:
+    case X86_DECODE_CMD_NEG:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool amdsvm_state_npf_mmio_rmw_supported(const struct x86_decode *decode)
+{
+    return !decode->lock && !decode->rep &&
+           decode->modrm.mod != 3 &&
+           decode->op[0].type == X86_VAR_RM &&
+           amdsvm_mmio_rmw_cmd(decode->cmd);
+}
+
+bool amdsvm_state_npf_mmio_read_supported(const struct x86_decode *decode)
+{
+    return !decode->lock && !decode->rep &&
+           decode->modrm.mod != 3 &&
+           decode->op[0].type == X86_VAR_RM &&
+           (decode->op[1].type == X86_VAR_REG ||
+            decode->op[1].type == X86_VAR_IMMEDIATE) &&
+           (decode->cmd == X86_DECODE_CMD_TST ||
+            decode->cmd == X86_DECODE_CMD_CMP ||
+            decode->cmd == X86_DECODE_CMD_BT) &&
+           (decode->operand_size == 1 || decode->operand_size == 2 ||
+            decode->operand_size == 4 || decode->operand_size == 8);
+}
+
+static int amdsvm_emulate_mmio_read(CPUState *cs, CPUX86State *env,
+                                    struct x86_decode *decode,
+                                    uint64_t exit_info1, uint64_t fault_gpa,
+                                    Error **errp)
+{
+    uint64_t linear, gpa;
+    unsigned width = decode->operand_size;
+    target_ulong original_rip = env->eip;
+    target_ulong original_rflags = env->eflags;
+    static unsigned emulation_logs;
+
+    if (!amdsvm_state_npf_mmio_read_supported(decode) ||
+        decode->segment_override != 0) {
+        error_setg(errp,
+                   "AMD-SVM MMIO read instruction is outside the supported TEST/CMP/BT profile");
+        return -ENOTSUP;
+    }
+
+    calc_modrm_operand(env, decode, &decode->op[0]);
+    linear = decode->op[0].addr;
+    if ((linear & 0xfff) + width > 0x1000 ||
+        mmu_gva_to_gpa(cs, linear, &gpa, 0) != MMU_TRANSLATE_SUCCESS ||
+        gpa != fault_gpa ||
+        !amdsvm_npf_targets_mmio(exit_info1, gpa, width, false)) {
+        error_setg(errp,
+                   "AMD-SVM MMIO TEST source does not match the reported device NPF");
+        return -EINVAL;
+    }
+
+    g_assert(bql_locked());
+    exec_instruction(env, decode);
+    if (env->eip != original_rip + decode->len) {
+        error_setg(errp, "AMD-SVM MMIO TEST emulation did not complete");
+        return -EIO;
+    }
+    if (emulation_logs < 64) {
+        error_report("AMDVM_NPF_MMIO_READ_EMULATED index=%u gpa=0x%llx width=%u cmd=%u rip=0x%llx->0x%llx rflags=0x%llx->0x%llx len=%u",
+                     emulation_logs++, (unsigned long long)fault_gpa,
+                     width, decode->cmd,
+                     (unsigned long long)original_rip,
+                     (unsigned long long)env->eip,
+                     (unsigned long long)original_rflags,
+                     (unsigned long long)env->eflags, decode->len);
+    }
+    return 0;
+}
+
+static int amdsvm_emulate_mmio_rmw(CPUState *cs, CPUX86State *env,
+                                   struct x86_decode *decode,
+                                   uint64_t exit_info1, uint64_t fault_gpa,
+                                   Error **errp)
+{
+    uint64_t linear, gpa;
+    unsigned width = decode->operand_size;
+    target_ulong original_rip = env->eip;
+    target_ulong original_rflags = env->eflags;
+    static unsigned emulation_logs;
+
+    if (!amdsvm_state_npf_mmio_rmw_supported(decode) ||
+        (width != 1 && width != 2 && width != 4 && width != 8)) {
+        error_setg(errp, "AMD-SVM MMIO RMW instruction is not supported by the interpreter");
+        return -ENOTSUP;
+    }
+
+    /* Keep the first generic slice deliberately narrow: no segment override. */
+    if (decode->segment_override != 0) {
+        error_setg(errp, "AMD-SVM MMIO RMW with a segment override is unsupported");
+        return -ENOTSUP;
+    }
+
+    calc_modrm_operand(env, decode, &decode->op[0]);
+    linear = decode->op[0].addr;
+    if ((linear & 0xfff) + width > 0x1000 ||
+        mmu_gva_to_gpa(cs, linear, &gpa,
+                       MMU_TRANSLATE_VALIDATE_WRITE) !=
+            MMU_TRANSLATE_SUCCESS || gpa != fault_gpa ||
+        !amdsvm_npf_targets_mmio(exit_info1, gpa, width, true)) {
+        error_setg(errp,
+                   "AMD-SVM MMIO RMW destination does not match the reported device NPF");
+        return -EINVAL;
+    }
+
+    if (amdsvm_emulate_mmio_memory_write(env, decode, errp) != 0) {
+        return -EIO;
+    }
+    if (env->eip != original_rip + decode->len) {
+        error_setg(errp, "AMD-SVM MMIO RMW did not complete exactly one instruction");
+        return -EIO;
+    }
+    if (emulation_logs < 64) {
+        error_report("AMDVM_NPF_MMIO_RMW_EMULATED index=%u gpa=0x%llx width=%u cmd=%u rip=0x%llx->0x%llx rflags=0x%llx->0x%llx len=%u",
+                     emulation_logs++, (unsigned long long)fault_gpa,
+                     width, decode->cmd,
+                     (unsigned long long)original_rip,
+                     (unsigned long long)env->eip,
+                     (unsigned long long)original_rflags,
+                     (unsigned long long)env->eflags, decode->len);
     }
     return 0;
 }
@@ -342,6 +570,19 @@ static bool amdsvm_msr_write(CPUState *cs)
                      ((uint64_t)(uint32_t)env->regs[R_EDX] << 32);
     uint64_t update_mask = 0;
     AMDVMMTRRRegister mtrr;
+    static unsigned tsc_write_logs;
+
+    if (msr == MSR_IA32_TSC && tsc_write_logs < 32) {
+        error_report("AMDVM_TSC_WR n=%u rip=0x%llx cs=%04x cs_base=0x%llx "
+                     "cr0=0x%llx value=0x%llx tsc_offset=0x%llx",
+                     tsc_write_logs, (unsigned long long)env->eip,
+                     env->segs[R_CS].selector,
+                     (unsigned long long)env->segs[R_CS].base,
+                     (unsigned long long)env->cr[0],
+                     (unsigned long long)value,
+                     (unsigned long long)env->tsc_offset);
+        tsc_write_logs++;
+    }
 
     if (amdsvm_msr_decode_mtrr(msr, &mtrr)) {
         switch (mtrr.kind) {
@@ -392,6 +633,11 @@ static bool amdsvm_msr_write(CPUState *cs)
     }
 
     switch (msr) {
+    case MSR_IA32_SPEC_CTRL:
+    case MSR_IA32_PRED_CMD:
+        /* TCG currently treats these advertised-but-unimplemented MSRs as
+         * no-ops on WRMSR. Match that behavior instead of injecting #GP. */
+        break;
     case MSR_IA32_SYSENTER_CS: env->sysenter_cs = value & 0xffff; break;
     case MSR_IA32_SYSENTER_ESP: env->sysenter_esp = value; break;
     case MSR_IA32_SYSENTER_EIP: env->sysenter_eip = value; break;
@@ -403,6 +649,10 @@ static bool amdsvm_msr_write(CPUState *cs)
         }
         env->pat = value;
         break;
+    case MSR_IA32_TSC:
+        env->tsc_offset = value - cpu_get_tsc(env);
+        break;
+    case MSR_TSC_AUX: env->tsc_aux = value; break;
     case MSR_EFER:
         if (env->features[FEAT_8000_0001_EDX] & CPUID_EXT2_SYSCALL) {
             update_mask |= MSR_EFER_SCE;
@@ -454,9 +704,18 @@ static const struct x86_emul_ops amdsvm_emulator_ops = {
     .is_user_mode = amdsvm_emulator_is_user_mode,
 };
 
+static void amdsvm_state_init_xsave_offsets(void)
+{
+    x86_ext_save_areas[XSTATE_FP_BIT].offset = 0;
+    x86_ext_save_areas[XSTATE_SSE_BIT].offset = 0;
+    x86_ext_save_areas[XSTATE_YMM_BIT].offset =
+        sizeof(X86LegacyXSaveArea) + sizeof(X86XSaveHeader);
+}
+
 void amdsvm_state_init_emulator(void)
 {
     if (!amdsvm_emulator_initialized) {
+        amdsvm_state_init_xsave_offsets();
         init_emu(&amdsvm_emulator_ops);
         init_decoder();
         amdsvm_emulator_initialized = true;
@@ -576,10 +835,10 @@ int amdsvm_handle_ioio_string_exit(CPUState *cs, uint64_t exit_info1,
         original_count = read_reg(env, R_ECX, decode.addressing_size);
         if (original_count != 0) {
             /*
-             * Batch a small bounded number of string-I/O elements per
-             * VMEXIT. SeaBIOS uses REP INSD for CD-ROM PIO; one element per
-             * entry makes boot throughput unusable. Keep a finite batch so
-             * QMP stop/kick still gets frequent VMEXIT opportunities.
+             * Batch a bounded number of string-I/O elements per VMEXIT.
+             * Windows PE loading uses REP INSW for CD-ROM PIO; a small batch
+             * makes each megabyte require many provider round trips. Keep the
+             * batch finite so QMP stop/kick still gets regular VMEXIT points.
              */
             batch_count = MIN(original_count,
                               (uint64_t)AMDSVM_IOIO_STRING_BATCH_MAX);
@@ -654,6 +913,7 @@ int amdsvm_handle_npf_write_exit(
     bool is_mmio_moffs_load, is_mmio_moffs_store;
     bool is_mmio_mov_reg_load, is_mmio_movzx_reg_load;
     bool is_mmio_mov_reg_store;
+    bool is_mmio_read_instruction;
     bool is_vga_string_movs;
     bool is_rom_arith_mem;
     bool unassigned_npf;
@@ -661,6 +921,7 @@ int amdsvm_handle_npf_write_exit(
     bool mmio_write_npf;
     unsigned mov_imm_prefix, mov_imm_size, mov_reg_prefix;
     bool mov_imm_has_op_prefix, mov_imm_has_addr_prefix;
+    bool mov_imm_has_rex_prefix;
     unsigned mov_reg_opcode_offset;
     unsigned mov_reg_ao_opcode_offset;
     bool mov_reg_ao_has_op_prefix, mov_reg_ao_has_addr_prefix;
@@ -693,21 +954,23 @@ int amdsvm_handle_npf_write_exit(
     }
 
     /*
-     * Firmware string writes are deliberately narrow. REP MOVSB may target
-     * the committed BIOS shadow mapping or a validated VGA aperture byte;
-     * VGA accesses are issued one byte at a time through QEMU's address space.
-     * A paged guest may also fault on a device MMIO load/store, but only the
-     * decoded, GPA-verified MOV forms below are allowed through that path.
-     * Other NPFs remain fail-closed.
+     * Firmware writes are deliberately narrow. They may target committed
+     * immutable ROM (including when firmware paging is enabled), a matching
+     * BIOS shadow, or a validated VGA aperture byte. A paged guest may also
+     * fault on device MMIO loads/stores; only the decoded, GPA-verified MOV
+     * forms below are allowed through those paths. Other NPFs remain
+     * fail-closed.
      */
     bool vga_npf = amdsvm_npf_targets_vga_mmio(exit_info1, fault_gpa, 1);
-    unassigned_npf = amdsvm_npf_targets_unassigned(exit_info1, fault_gpa, 1);
+    unassigned_npf = amdsvm_npf_targets_unassigned(exit_info1, fault_gpa, 1,
+                                                   true);
 
     if ((exit_info1 != ((UINT64_C(1) << 32) | 7u) &&
          !vga_npf && !unassigned_npf && !mmio_read_npf &&
          !mmio_write_npf) ||
         ((env->cr[0] & (UINT64_C(1) << 31)) != 0 &&
-         !mmio_read_npf && !mmio_write_npf) ||
+         !mmio_read_npf && !mmio_write_npf &&
+         immutable_rom_bytes == 0) ||
         (env->eflags & (1u << 17)) != 0 ||
         !amdsvm_emulator_initialized) {
         error_setg(errp,
@@ -728,19 +991,28 @@ int amdsvm_handle_npf_write_exit(
     mov_imm_prefix = 0;
     mov_imm_has_op_prefix = false;
     mov_imm_has_addr_prefix = false;
+    mov_imm_has_rex_prefix = false;
     while (mov_imm_prefix < instruction_length &&
            (instruction_bytes[mov_imm_prefix] == 0x66 ||
-            instruction_bytes[mov_imm_prefix] == 0x67)) {
+            instruction_bytes[mov_imm_prefix] == 0x67 ||
+            ((env->hflags & HF_CS64_MASK) &&
+             instruction_bytes[mov_imm_prefix] >= 0x40 &&
+             instruction_bytes[mov_imm_prefix] <= 0x4f))) {
         if (instruction_bytes[mov_imm_prefix] == 0x66) {
-            if (mov_imm_has_op_prefix) {
+            if (mov_imm_has_op_prefix || mov_imm_has_rex_prefix) {
                 break;
             }
             mov_imm_has_op_prefix = true;
-        } else {
-            if (mov_imm_has_addr_prefix) {
+        } else if (instruction_bytes[mov_imm_prefix] == 0x67) {
+            if (mov_imm_has_addr_prefix || mov_imm_has_rex_prefix) {
                 break;
             }
             mov_imm_has_addr_prefix = true;
+        } else {
+            if (mov_imm_has_rex_prefix) {
+                break;
+            }
+            mov_imm_has_rex_prefix = true;
         }
         mov_imm_prefix++;
     }
@@ -887,6 +1159,9 @@ int amdsvm_handle_npf_write_exit(
     is_mmio_moffs_store = mmio_write_npf && instruction_length >= 1u &&
                           (instruction_bytes[0] == 0xa2 ||
                            instruction_bytes[0] == 0xa3);
+    /* Decode read-only device operations with the shared interpreter, then
+     * admit only the explicitly validated TEST memory form below. */
+    is_mmio_read_instruction = mmio_read_npf;
     mmio_reg_load_opcode_offset = 0;
     while (mmio_reg_load_opcode_offset < instruction_length &&
            (instruction_bytes[mmio_reg_load_opcode_offset] == 0x66 ||
@@ -1003,6 +1278,7 @@ int amdsvm_handle_npf_write_exit(
     stream.len = instruction_length;
     if ((!is_mmio_moffs_load && !is_mmio_mov_reg_load &&
          !is_mmio_movzx_reg_load &&
+         !is_mmio_read_instruction &&
          !is_mmio_mov_reg_store &&
          !is_vga_rom_cmp && !is_vga_string_stos && !is_vga_string_movs &&
          !is_rom_pop_rm &&
@@ -1010,11 +1286,19 @@ int amdsvm_handle_npf_write_exit(
          !is_rom_push_reg &&
          !is_rom_movsb && !is_rom_mov_imm &&
          !is_rom_mov_reg && !is_rom_or_imm8 && !is_rom_or_reg &&
-         !is_rom_mov_moffs &&
-         !is_rom_arith_mem) ||
+        !is_rom_mov_moffs &&
+        !is_rom_arith_mem && !mmio_write_npf) ||
         decode_instruction_stream(env, &decode, &stream) == 0 ||
+        (mmio_write_npf && decode.len > instruction_length) ||
         (decode.addressing_size != 4 &&
+         !(mmio_write_npf && decode.addressing_size == 2) &&
+         !(mmio_write_npf && (env->hflags & HF_CS64_MASK) &&
+           decode.addressing_size == 8) &&
+         !(is_rom_mov_imm && (env->hflags & HF_CS64_MASK) &&
+           decode.addressing_size == 8) &&
          !(is_mmio_mov_reg_load && decode.addressing_size == 8) &&
+         !(is_mmio_read_instruction && (env->hflags & HF_CS64_MASK) &&
+           decode.addressing_size == 8) &&
          !(is_mmio_movzx_reg_load && decode.addressing_size == 8) &&
          !(is_mmio_mov_reg_store && decode.addressing_size == 8) &&
         !((is_vga_string_stos || is_vga_string_movs) &&
@@ -1045,7 +1329,9 @@ int amdsvm_handle_npf_write_exit(
                         !is_mmio_mov_reg_load &&
                         !is_mmio_movzx_reg_load &&
                         !is_mmio_mov_reg_store &&
+                        !is_mmio_read_instruction &&
                         !is_rom_arith_mem &&
+                        !mmio_write_npf &&
                         !is_rom_or_imm8 &&
                         !is_vga_string_stos &&
                         !is_vga_string_movs &&
@@ -1279,6 +1565,24 @@ int amdsvm_handle_npf_write_exit(
         return -EINVAL;
     }
 
+    /*
+     * Route decoded, supported memory RMW operations through QEMU's x86
+     * interpreter. Its x86_read_mem/x86_write_mem calls reach the normal
+     * AddressSpace and device MemoryRegion callbacks. The exact GPA, access
+     * direction, width, and assigned MMIO region are checked above here.
+     */
+    if (mmio_write_npf &&
+        amdsvm_state_npf_mmio_rmw_supported(&decode)) {
+        return amdsvm_emulate_mmio_rmw(cs, env, &decode, exit_info1,
+                                       fault_gpa, errp);
+    }
+
+    if (is_mmio_read_instruction &&
+        amdsvm_state_npf_mmio_read_supported(&decode)) {
+        return amdsvm_emulate_mmio_read(cs, env, &decode, exit_info1,
+                                        fault_gpa, errp);
+    }
+
     if (is_vga_string_stos) {
         uint64_t original_count, batch, offset, linear, gpa;
         uint64_t max_in_aperture, max_in_segment;
@@ -1352,9 +1656,9 @@ int amdsvm_handle_npf_write_exit(
         linear = decode.op[0].addr;
         if (mmu_gva_to_gpa(cs, linear, &gpa, 0) !=
                 MMU_TRANSLATE_SUCCESS || gpa != fault_gpa ||
-            !amdsvm_npf_targets_vga_rom_read(exit_info1, gpa,
+            !amdsvm_npf_targets_readonly_rom(exit_info1, gpa,
                                              decode.operand_size)) {
-            error_setg(errp, "AMD-SVM compare does not target mapped VGA ROM");
+            error_setg(errp, "AMD-SVM compare does not target mapped read-only ROM");
             return -EINVAL;
         }
         exec_instruction(env, &decode);
@@ -1573,14 +1877,23 @@ int amdsvm_handle_npf_write_exit(
         target_ulong original_rip = env->eip;
         uint64_t linear, gpa;
         unsigned width = decode.operand_size;
+        bool mapped_mmio, mapped_rom, mapped_unassigned;
 
         calc_modrm_operand(env, &decode, &decode.op[1]);
         linear = decode.op[1].addr;
         if (mmu_gva_to_gpa(cs, linear, &gpa, 0) !=
-                MMU_TRANSLATE_SUCCESS || gpa != fault_gpa ||
-            !amdsvm_npf_targets_mmio(exit_info1, gpa, width, false)) {
+                MMU_TRANSLATE_SUCCESS || gpa != fault_gpa) {
             error_setg(errp,
-                       "AMD-SVM register MOV read does not target a mapped MMIO device");
+                       "AMD-SVM register MOV read does not match the reported GPA");
+            return -EINVAL;
+        }
+        mapped_mmio = amdsvm_npf_targets_mmio(exit_info1, gpa, width, false);
+        mapped_rom = amdsvm_npf_targets_readonly_rom(exit_info1, gpa, width);
+        mapped_unassigned = amdsvm_npf_targets_unassigned(
+            exit_info1, gpa, width, false);
+        if (!mapped_mmio && !mapped_rom && !mapped_unassigned) {
+            error_setg(errp,
+                       "AMD-SVM register MOV read does not target MMIO, ROM, or unassigned memory");
             return -EINVAL;
         }
         exec_instruction(env, &decode);
@@ -1769,7 +2082,7 @@ int amdsvm_handle_npf_write_exit(
             if (amdsvm_npf_targets_mmio(exit_info1, gpa, width, true)) {
                 return amdsvm_emulate_mmio_memory_write(env, &decode, errp);
             }
-            if (amdsvm_npf_targets_unassigned(exit_info1, gpa, width)) {
+            if (amdsvm_npf_targets_unassigned(exit_info1, gpa, width, true)) {
                 target_ulong original_rip = env->eip;
 
                 exec_instruction(env, &decode);
@@ -1860,7 +2173,8 @@ int amdsvm_handle_npf_write_exit(
             if (amdsvm_npf_targets_mmio(exit_info1, gpa, width, true)) {
                 return amdsvm_emulate_mmio_memory_write(env, &decode, errp);
             }
-            if (!amdsvm_npf_targets_unassigned(exit_info1, gpa, width)) {
+            if (!amdsvm_npf_targets_unassigned(exit_info1, gpa, width,
+                                               true)) {
                 error_setg(errp, "AMD-SVM immediate arithmetic destination is outside immutable ROM and VGA MMIO");
                 return -EINVAL;
             }
@@ -1902,7 +2216,8 @@ int amdsvm_handle_npf_write_exit(
                 return -EINVAL;
             }
             if (immutable_rom_bytes < width &&
-                !amdsvm_npf_targets_unassigned(exit_info1, gpa, width)) {
+                !amdsvm_npf_targets_unassigned(exit_info1, gpa, width,
+                                               true)) {
                 error_setg(errp, "AMD-SVM real-mode ES MOV moffs is outside immutable ROM");
                 return -EINVAL;
             }
@@ -1945,7 +2260,8 @@ int amdsvm_handle_npf_write_exit(
             if (amdsvm_npf_targets_mmio(exit_info1, gpa, width, true)) {
                 return amdsvm_emulate_mmio_memory_write(env, &decode, errp);
             }
-            if (!amdsvm_npf_targets_unassigned(exit_info1, gpa, width)) {
+            if (!amdsvm_npf_targets_unassigned(exit_info1, gpa, width,
+                                               true)) {
                 error_setg(errp, "AMD-SVM MOV moffs destination is outside immutable ROM and VGA MMIO");
                 return -EINVAL;
             }
@@ -2007,7 +2323,8 @@ int amdsvm_handle_npf_write_exit(
             if (amdsvm_npf_targets_mmio(exit_info1, gpa, width, true)) {
                 return amdsvm_emulate_mmio_memory_write(env, &decode, errp);
             }
-            if (!amdsvm_npf_targets_unassigned(exit_info1, gpa, width)) {
+            if (!amdsvm_npf_targets_unassigned(exit_info1, gpa, width,
+                                               true)) {
                 error_setg(errp, "AMD-SVM arithmetic destination is outside immutable ROM and VGA MMIO");
                 return -EINVAL;
             }
@@ -2071,13 +2388,20 @@ int amdsvm_handle_npf_write_exit(
                 return -EINVAL;
             }
         } else if (mmio_write_npf) {
+            AMDVMNPFMemoryType src_type =
+                amdsvm_npf_classify_memory(src_gpa, width, false);
             if (dst_gpa != fault_gpa ||
                 !amdsvm_npf_targets_mmio(exit_info1, dst_gpa, width, true) ||
                 dst_gpa < AMDSVM_VGA_APERTURE_START ||
                 dst_gpa >= AMDSVM_VGA_APERTURE_END ||
-                !amdsvm_npf_targets_ram(src_gpa, width, false)) {
+                (src_type != AMDVM_NPF_MEMORY_RAM &&
+                 src_type != AMDVM_NPF_MEMORY_ROM &&
+                 src_type != AMDVM_NPF_MEMORY_MMIO)) {
                 error_setg(errp,
-                           "AMD-SVM VGA REP MOVS write is outside RAM-to-VGA transfer");
+                           "AMD-SVM VGA REP MOVS write is outside readable-to-VGA transfer (src=0x%llx dst=0x%llx fault=0x%llx src_type=%d)",
+                           (unsigned long long)src_gpa,
+                           (unsigned long long)dst_gpa,
+                           (unsigned long long)fault_gpa, src_type);
                 return -EINVAL;
             }
         } else {
@@ -2154,7 +2478,7 @@ int amdsvm_handle_npf_write_exit(
             MMU_TRANSLATE_SUCCESS || dst_gpa != fault_gpa ||
         (immutable_rom_bytes == 0 &&
          !amdsvm_npf_targets_vga_mmio(exit_info1, dst_gpa, 1) &&
-         !amdsvm_npf_targets_unassigned(exit_info1, dst_gpa, 1))) {
+         !amdsvm_npf_targets_unassigned(exit_info1, dst_gpa, 1, true))) {
         error_setg(errp, "AMD-SVM REP MOVSB addresses do not match the reported NPF GPA");
         return -EINVAL;
     }
@@ -2346,10 +2670,12 @@ static bool amdsvm_cr_exit_code(uint64_t exit_code, unsigned *cr,
     case SVM_EXIT_READ_CR2: *cr = 2; *write = false; return true;
     case SVM_EXIT_READ_CR3: *cr = 3; *write = false; return true;
     case SVM_EXIT_READ_CR4: *cr = 4; *write = false; return true;
+    case SVM_EXIT_READ_CR8: *cr = 8; *write = false; return true;
     case SVM_EXIT_WRITE_CR0: *cr = 0; *write = true; return true;
     case SVM_EXIT_WRITE_CR2: *cr = 2; *write = true; return true;
     case SVM_EXIT_WRITE_CR3: *cr = 3; *write = true; return true;
     case SVM_EXIT_WRITE_CR4: *cr = 4; *write = true; return true;
+    case SVM_EXIT_WRITE_CR8: *cr = 8; *write = true; return true;
     default: return false;
     }
 }
@@ -2399,6 +2725,10 @@ static bool amdsvm_cr_write_valid(CPUX86State *env, X86CPU *cpu,
             *normalized = value & ~noflush;
             return true;
         }
+    case 8:
+        /* CR8 aliases the APIC TPR; only the low four TPR bits are stored. */
+        *normalized = value & 0xfu;
+        return true;
     case 4:
         if (value > UINT32_MAX ||
             (value & cr4_reserved_bits(env)) ||
@@ -2519,6 +2849,13 @@ bool amdsvm_handle_cr_exit(CPUState *cs, uint64_t exit_code,
         case 2: value = env->cr[2]; break;
         case 3: value = env->cr[3]; break;
         case 4: value = env->cr[4]; break;
+        case 8:
+            if (!(env->hflags2 & HF2_VINTR_MASK) && cpu->apic_state) {
+                value = cpu_get_apic_tpr(cpu->apic_state);
+            } else {
+                value = env->int_ctl & 0xfu;
+            }
+            break;
         default: g_assert_not_reached();
         }
         if (!(env->hflags & HF_CS64_MASK)) {
@@ -2550,6 +2887,12 @@ bool amdsvm_handle_cr_exit(CPUState *cs, uint64_t exit_code,
         case 2: env->cr[2] = normalized; break;
         case 3: cpu_x86_update_cr3(env, normalized); break;
         case 4: cpu_x86_update_cr4(env, normalized); break;
+        case 8:
+            if (!(env->hflags2 & HF2_VINTR_MASK) && cpu->apic_state) {
+                cpu_set_apic_tpr(cpu->apic_state, normalized);
+            }
+            env->int_ctl = (env->int_ctl & ~0xfu) | (normalized & 0xfu);
+            break;
         default: g_assert_not_reached();
         }
     }
@@ -2700,7 +3043,7 @@ int amdsvm_state_validate(const amdvm_x86_guest_state_v1_t *state)
     uint64_t xcomp_bv;
     unsigned i;
 
-    if (!state || state->abi_version != AMDVM_X86_STATE_ABI_VERSION ||
+    if (!state || !amdvm_x86_state_abi_supported(state->abi_version) ||
         (state->interruptibility & ~(AMDVM_X86_INTERRUPTIBILITY_STI_SHADOW |
          AMDVM_X86_INTERRUPTIBILITY_NMI_BLOCKED |
          AMDVM_X86_INTERRUPTIBILITY_NMI_IRET_STEP)) ||
@@ -2709,7 +3052,10 @@ int amdsvm_state_validate(const amdvm_x86_guest_state_v1_t *state)
         state->xstate_reserved ||
         state->xstate_size != AMDVM_X86_XSTATE_MAX_SIZE ||
         (state->rflags & 2u) == 0 ||
-        (state->cr[1] != 0) ||
+        (state->abi_version == AMDVM_X86_STATE_ABI_VERSION_V2 &&
+         state->cr[1] != 0) ||
+        (state->abi_version == AMDVM_X86_STATE_ABI_VERSION_V3 &&
+         !AMDVM_X86_STATE_CR8_VALID(state->cr[1])) ||
         /* SVM is not exposed as a guest feature in this provider ABI. */
         (state->efer & AMDVM_EFER_SVME)) {
         return -EINVAL;
@@ -2956,7 +3302,7 @@ int amdsvm_state_load(CPUState *cs, amdvm_x86_guest_state_v1_t *state)
     unsigned i;
 
     memset(state, 0, sizeof(*state));
-    state->abi_version = AMDVM_X86_STATE_ABI_VERSION;
+    state->abi_version = amdsvm_wire_state_abi;
     for (i = 0; i < AMDVM_X86_GPR_COUNT; i++) {
         state->gpr[i] = env->regs[i];
     }
@@ -2978,6 +3324,8 @@ int amdsvm_state_load(CPUState *cs, amdvm_x86_guest_state_v1_t *state)
     for (i = 0; i < ARRAY_SIZE(state->cr); i++) {
         state->cr[i] = env->cr[i];
     }
+    state->cr[1] = amdsvm_wire_state_abi == AMDVM_X86_STATE_ABI_VERSION_V3 ?
+        cpu_get_apic_tpr(cpu->apic_state) : 0;
     state->efer = env->efer;
     for (i = 0; i < ARRAY_SIZE(state->dr); i++) {
         state->dr[i] = env->dr[i];
@@ -3004,10 +3352,28 @@ int amdsvm_state_store(CPUState *cs,
 {
     X86CPU *cpu = X86_CPU(cs);
     CPUX86State *env = &cpu->env;
+    uint64_t normalized_cr3 = 0;
+    bool cr3_changed;
     unsigned i;
 
     if (amdsvm_state_validate(state) != 0) {
         return -EINVAL;
+    }
+    /* CR0/CR4 are intercepted and committed only by the canonical CR exit
+     * helpers. A generic state copy must never bypass their validation or
+     * TLB/mode side effects. */
+    if (state->cr[0] != env->cr[0] || state->cr[4] != env->cr[4]) {
+        return -EINVAL;
+    }
+    cr3_changed = state->cr[3] != env->cr[3];
+    if (cr3_changed) {
+        /* CR0/CR4/EFER transitions remain intercepted and QEMU-managed. */
+        if (state->cr[0] != env->cr[0] || state->cr[4] != env->cr[4] ||
+            state->efer != env->efer ||
+            !amdsvm_cr_write_valid(env, cpu, 3, state->cr[3],
+                                   &normalized_cr3)) {
+            return -EINVAL;
+        }
     }
     for (i = 0; i < AMDVM_X86_GPR_COUNT; i++) {
         env->regs[i] = state->gpr[i];
@@ -3033,7 +3399,20 @@ int amdsvm_state_store(CPUState *cs,
     amdsvm_segment_to_qemu(&env->idt, &state->segments[AMDVM_X86_SEG_IDTR]);
     amdsvm_segment_to_qemu(&env->tr, &state->segments[AMDVM_X86_SEG_TR]);
     for (i = 0; i < ARRAY_SIZE(state->cr); i++) {
-        env->cr[i] = state->cr[i];
+        if (i != 0 && i != 3 && i != 4) {
+            env->cr[i] = state->cr[i];
+        }
+    }
+    if (cr3_changed) {
+        /* Keep QEMU's CR3 normalization and software-TLB invalidation path. */
+        cpu_x86_update_cr3(env, normalized_cr3);
+    }
+    if (state->abi_version == AMDVM_X86_STATE_ABI_VERSION_V3) {
+        cpu_set_apic_tpr(cpu->apic_state, state->cr[1]);
+        env->int_ctl = (env->int_ctl & ~V_TPR_MASK) |
+            (state->cr[1] & V_TPR_MASK);
+    } else {
+        env->cr[1] = 0;
     }
     env->efer = state->efer;
     for (i = 0; i < ARRAY_SIZE(state->dr); i++) {
@@ -3060,12 +3439,48 @@ int amdsvm_state_store(CPUState *cs,
 int amdsvm_state_read_tsc(CPUState *cs, uint64_t *value)
 {
     CPUX86State *env;
+    uint64_t tsc;
+    static unsigned tsc_rdtsc_logs;
 
     if (!cs || !value) {
         return -EINVAL;
     }
     env = &X86_CPU(cs)->env;
-    *value = cpu_get_tsc(env) + env->tsc_offset;
+    tsc = cpu_get_tsc(env) + env->tsc_offset;
+    if (tsc_rdtsc_logs < 32) {
+        error_report("AMDVM_TSC_RDTSC n=%u rip=0x%llx cs=%04x cs_base=0x%llx "
+                     "cr0=0x%llx tsc_offset=0x%llx value=0x%llx",
+                     tsc_rdtsc_logs, (unsigned long long)env->eip,
+                     env->segs[R_CS].selector,
+                     (unsigned long long)env->segs[R_CS].base,
+                     (unsigned long long)env->cr[0],
+                     (unsigned long long)env->tsc_offset,
+                     (unsigned long long)tsc);
+        tsc_rdtsc_logs++;
+    }
+    *value = tsc;
+    return 0;
+}
+
+int amdsvm_state_get_native_tsc_offset(CPUState *cs, uint64_t *offset)
+{
+    CPUX86State *env;
+    if (!cs || !offset) {
+        return -EINVAL;
+    }
+    env = &X86_CPU(cs)->env;
+    /* QEMU's emulated TSC is elapsed host ticks plus this vCPU's offset. */
+    *offset = (uint64_t)(cpu_get_tsc(env) + env->tsc_offset -
+                         cpu_get_host_ticks());
+    return 0;
+}
+
+int amdsvm_state_read_tsc_aux(CPUState *cs, uint32_t *value)
+{
+    if (!cs || !value) {
+        return -EINVAL;
+    }
+    *value = (uint32_t)X86_CPU(cs)->env.tsc_aux;
     return 0;
 }
 
@@ -3073,8 +3488,68 @@ void amdsvm_emulate_cpuid(CPUState *cs, uint32_t leaf, uint32_t subleaf,
                           uint32_t *eax, uint32_t *ebx, uint32_t *ecx,
                           uint32_t *edx)
 {
-    cpu_x86_cpuid(&X86_CPU(cs)->env, leaf, subleaf,
-                  eax, ebx, ecx, edx);
+    static bool xstate_cpuid_logged[5];
+    static int vmware_freq_cpuid_logged;
+    X86CPU *cpu = X86_CPU(cs);
+    CPUX86State *env = &X86_CPU(cs)->env;
+    int log_slot = -1;
+
+    if (cpu->vmware_cpuid_freq && leaf >= 0x40000000 &&
+        leaf <= 0x40000010) {
+#ifdef __APPLE__
+        size_t length;
+        uint64_t frequency;
+
+        if (!env->tsc_khz) {
+            length = sizeof(frequency);
+            if (!sysctlbyname("machdep.tsc.frequency", &frequency,
+                              &length, NULL, 0)) {
+                env->tsc_khz = frequency / 1000;
+            }
+        }
+        if (!env->apic_bus_freq) {
+            length = sizeof(frequency);
+            if (!sysctlbyname("hw.busfrequency", &frequency, &length,
+                              NULL, 0)) {
+                env->apic_bus_freq = frequency;
+            }
+        }
+#endif
+        if (env->tsc_khz && env->apic_bus_freq) {
+            if (leaf == 0x40000000) {
+                *eax = 0x40000010;
+                *ebx = *ecx = *edx = 0;
+            } else if (leaf == 0x40000010) {
+                *eax = env->tsc_khz;
+                *ebx = env->apic_bus_freq / 1000;
+                *ecx = *edx = 0;
+                if (qatomic_cmpxchg(&vmware_freq_cpuid_logged, 0, 1) == 0) {
+                    error_report("AMDVM_CPUID_TSC_FREQ leaf=0x40000010 "
+                                 "tsc_khz=%u apic_bus_khz=%u",
+                                 (uint32_t)env->tsc_khz,
+                                 (uint32_t)(env->apic_bus_freq / 1000));
+                }
+            } else {
+                *eax = *ebx = *ecx = *edx = 0;
+            }
+        } else {
+            cpu_x86_cpuid(env, leaf, subleaf, eax, ebx, ecx, edx);
+        }
+    } else {
+        cpu_x86_cpuid(env, leaf, subleaf, eax, ebx, ecx, edx);
+    }
+    amdsvm_cpuid_mask_xstate_profile(leaf, subleaf, env->xcr0,
+                                     eax, ebx, ecx, edx);
+    if (leaf == 0x0d && subleaf <= 2) {
+        log_slot = 2 + subleaf;
+    } else if (leaf == 7 && subleaf <= 1) {
+        log_slot = subleaf;
+    }
+    if (log_slot >= 0 && !xstate_cpuid_logged[log_slot]) {
+        error_report("AMDVM_XSTATE_CPUID leaf=0x%x subleaf=0x%x eax=0x%08x ebx=0x%08x ecx=0x%08x edx=0x%08x",
+                     leaf, subleaf, *eax, *ebx, *ecx, *edx);
+        xstate_cpuid_logged[log_slot] = true;
+    }
     /* This provider does not implement nested SVM for the guest. */
     if (leaf == 0x80000001u) {
         *ecx &= ~CPUID_EXT3_SVM;
@@ -3092,14 +3567,26 @@ int amdsvm_handle_xsetbv_exit(CPUState *cs, uint64_t next_rip,
                      (uint32_t)env->regs[R_EAX];
     uint64_t supported = ((uint64_t)env->features[FEAT_XSAVE_XCR0_HI] << 32) |
                          env->features[FEAT_XSAVE_XCR0_LO];
+    bool value_valid = amdsvm_xsetbv_value_valid(
+        value, (uint32_t)env->regs[R_ECX],
+        env->segs[R_CS].selector & 3, supported);
 
     *event_injection = 0;
+    error_report("AMDVM_XSETBV rip=0x%llx next_rip=0x%llx index=0x%x value=0x%llx supported=0x%llx current_xcr0=0x%llx cr4=0x%llx cpl=%u valid=%u",
+                 (unsigned long long)env->eip,
+                 (unsigned long long)next_rip,
+                 (uint32_t)env->regs[R_ECX],
+                 (unsigned long long)value,
+                 (unsigned long long)supported,
+                 (unsigned long long)env->xcr0,
+                 (unsigned long long)env->cr[4],
+                 env->segs[R_CS].selector & 3,
+                 value_valid);
     /* Hardware delivers #UD before the intercept if OSXSAVE is clear. */
     if (!(env->cr[4] & CR4_OSXSAVE_MASK)) {
         return -EINVAL;
     }
-    if (!amdsvm_xsetbv_value_valid(value, (uint32_t)env->regs[R_ECX],
-                                   env->segs[R_CS].selector & 3, supported)) {
+    if (!value_valid) {
         *event_injection = AMDVM_VCPU_EVENTINJ_VALID |
                            AMDVM_VCPU_EVENTINJ_TYPE_EXCEPTION |
                            AMDVM_VCPU_EVENTINJ_ERROR_VALID |

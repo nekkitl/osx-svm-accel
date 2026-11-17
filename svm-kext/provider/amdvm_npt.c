@@ -366,6 +366,8 @@ int
 amdvm_npt_map_4k_pages(amdvm_npt_t *npt, uint64_t guest_gpa,
 	const uint64_t *host_page_pas, size_t page_count, uint32_t permissions)
 {
+	uint64_t *pml4 = NULL, *pdpt = NULL, *pd = NULL, *pt = NULL;
+	size_t cached_pml4 = SIZE_MAX, cached_pdpt = SIZE_MAX, cached_pd = SIZE_MAX;
 	size_t i;
 	uint64_t bytes;
 
@@ -392,18 +394,49 @@ amdvm_npt_map_4k_pages(amdvm_npt_t *npt, uint64_t guest_gpa,
 		}
 	}
 
+	pml4 = amdvm_table(npt, 0);
 	/*
+	 * GPA ranges are mapped in order. Reuse the current PT while the next
+	 * 4 KiB page stays inside the same 2 MiB span; this avoids three table
+	 * walks and their scatter-pool PA lookups for every page in large RAM maps.
 	 * A table-pool exhaustion can still leave earlier leaves installed. The
-	 * only supported caller is construction of a new context which is thrown
-	 * away in full if this routine returns an error.
+	 * only supported caller constructs a fresh context which is discarded on
+	 * failure.
 	 */
 	for (i = 0; i < page_count; ++i) {
-		int rc = amdvm_npt_map_4k(npt,
-		    guest_gpa + (uint64_t)i * AMDVM_NPT_PAGE_SIZE,
-		    host_page_pas[i], permissions);
-		if (rc != AMDVM_NPT_OK) {
-			return rc;
+		uint64_t gpa = guest_gpa + (uint64_t)i * AMDVM_NPT_PAGE_SIZE;
+		size_t pml4_index = (size_t)((gpa >> 39) & 0x1ffu);
+		size_t pdpt_index = (size_t)((gpa >> 30) & 0x1ffu);
+		size_t pd_index = (size_t)((gpa >> 21) & 0x1ffu);
+		size_t pt_index = (size_t)((gpa >> 12) & 0x1ffu);
+		int rc;
+
+		if (pml4_index != cached_pml4) {
+			rc = amdvm_next_table(npt, pml4, pml4_index, &pdpt);
+			if (rc != AMDVM_NPT_OK) return rc;
+			cached_pml4 = pml4_index;
+			cached_pdpt = SIZE_MAX;
+			cached_pd = SIZE_MAX;
 		}
+		if (pdpt_index != cached_pdpt) {
+			rc = amdvm_next_table(npt, pdpt, pdpt_index, &pd);
+			if (rc != AMDVM_NPT_OK) return rc;
+			cached_pdpt = pdpt_index;
+			cached_pd = SIZE_MAX;
+		}
+		if (pd_index != cached_pd) {
+			rc = amdvm_next_table(npt, pd, pd_index, &pt);
+			if (rc != AMDVM_NPT_OK) return rc;
+			cached_pd = pd_index;
+		}
+		if ((pt[pt_index] & AMDVM_PTE_PRESENT) != 0) {
+			return AMDVM_NPT_CONFLICT;
+		}
+		uint64_t leaf = host_page_pas[i] & AMDVM_PTE_ADDR;
+		leaf |= AMDVM_PTE_PRESENT | AMDVM_PTE_USER;
+		if (permissions & AMDVM_NPT_WRITE) leaf |= AMDVM_PTE_WRITE;
+		if ((permissions & AMDVM_NPT_EXECUTE) == 0) leaf |= AMDVM_PTE_NX;
+		pt[pt_index] = leaf;
 	}
 	return AMDVM_NPT_OK;
 }

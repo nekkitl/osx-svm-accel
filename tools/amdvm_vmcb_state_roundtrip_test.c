@@ -79,6 +79,50 @@ main(void)
 	    AMDVM_VMCB_NEXT_RIP);
 	assert(exit_snapshot.next_rip == UINT64_C(0x123456789abcdef0));
 	assert(offsetof(amdvm_vmexit_snapshot_t, next_rip) == 40);
+	amdvm_vmcb_set_u64(vmcb, AMDVM_VMCB_EXIT_CODE, 0x77);
+	amdvm_vmcb_set_u64(vmcb, AMDVM_VMCB_EXIT_INFO1, 0x11);
+	amdvm_vmcb_set_u64(vmcb, AMDVM_VMCB_EXIT_INFO2, 0x22);
+	amdvm_vmcb_set_u64(vmcb, AMDVM_VMCB_GUEST_RIP, 0x1000);
+	amdvm_vmcb_set_u64(vmcb, AMDVM_VMCB_GUEST_RFLAGS, 0x202);
+	amdvm_vmcb_set_u64(vmcb, AMDVM_VMCB_EVENT_INJECTION, 0x80000040);
+	amdvm_vmcb_set_u64(vmcb, AMDVM_VMCB_EXIT_INT_INFO, 0x8000020e);
+	amdvm_vmcb_set_u32(vmcb, AMDVM_VMCB_EXIT_INT_INFO_ERROR, 14);
+	amdvm_vmcb_set_u64(vmcb, AMDVM_VMCB_TLB_CONTROL, 0x300000007);
+	amdvm_vmcb_set_u32(vmcb, AMDVM_VMCB_CLEAN_BITS, 0x1234);
+	amdvm_vmcb_set_u32(vmcb, AMDVM_VMCB_INTERRUPT_STATE,
+	    AMDVM_VMCB_INTERRUPT_SHADOW);
+	amdvm_vmcb_set_u32(vmcb, AMDVM_VMCB_INTERCEPT_MISC1,
+	    AMDVM_SVM_INTERCEPT_IRET);
+	vmcb->bytes[AMDVM_VMCB_DECODE_ASSIST_LENGTH] = 2;
+	vmcb->bytes[AMDVM_VMCB_DECODE_ASSIST_BYTES] = 0xf3;
+	vmcb->bytes[AMDVM_VMCB_DECODE_ASSIST_BYTES + 1] = 0x90;
+	amdvm_vmexit_snapshot_capture(vmcb, &exit_snapshot);
+	assert(exit_snapshot.code == 0x77 && exit_snapshot.info1 == 0x11 &&
+	    exit_snapshot.info2 == 0x22 && exit_snapshot.guest_rip == 0x1000);
+	assert(exit_snapshot.event_injection == 0x80000040 &&
+	    exit_snapshot.exit_int_info == 0x8000020e &&
+	    exit_snapshot.exit_int_info_error == 14);
+	assert(exit_snapshot.tlb_control == 0x300000007 &&
+	    exit_snapshot.clean_bits == 0x1234);
+	assert(exit_snapshot.guest_interruptibility ==
+	    (AMDVM_X86_INTERRUPTIBILITY_STI_SHADOW |
+	     AMDVM_X86_INTERRUPTIBILITY_NMI_BLOCKED));
+	assert(exit_snapshot.instruction_length == 2 &&
+	    exit_snapshot.instruction_bytes[0] == 0xf3 &&
+	    exit_snapshot.instruction_bytes[1] == 0x90);
+	/* Later VMCB cleanup cannot rewrite the preserved failure evidence. */
+	amdvm_vmcb_set_u64(vmcb, AMDVM_VMCB_TLB_CONTROL, 7);
+	amdvm_vmcb_set_u32(vmcb, AMDVM_VMCB_CLEAN_BITS, 0);
+	assert(exit_snapshot.tlb_control == 0x300000007 &&
+	    exit_snapshot.clean_bits == 0x1234);
+	assert(amdvm_vmrun_status_for_exit(AMDVM_VMRUN_SUCCESS,
+	    AMDVM_SVM_EXIT_ERR) == AMDVM_VMRUN_SUCCESS);
+	assert(amdvm_vmrun_status_for_exit(AMDVM_VMRUN_SUCCESS,
+	    AMDVM_SVM_EXIT_INVALID) == AMDVM_VMRUN_HARDWARE_INVALID);
+	assert(amdvm_vmrun_status_for_exit(AMDVM_VMRUN_SUCCESS,
+	    AMDVM_SVM_EXIT_NOT_RUN) == AMDVM_VMRUN_NO_EXIT);
+	assert(amdvm_vmrun_status_for_exit(AMDVM_VMRUN_DEBUGGER_ACTIVE,
+	    AMDVM_SVM_EXIT_ERR) == AMDVM_VMRUN_DEBUGGER_ACTIVE);
 	input.abi_version = AMDVM_X86_STATE_ABI_VERSION;
 	input.rflags = 2;
 	input.cr[0] = 0x80000011;
@@ -126,6 +170,115 @@ main(void)
 	assert(amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_GUEST_PAT) == input.pat);
 	assert(amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_GUEST_RSP) == input.gpr[4]);
 	assert(amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_GUEST_RAX) == input.gpr[0]);
+	{
+		uint32_t unchanged = amdvm_vmcb_state_clean_candidates(vmcb, &input);
+		const uint32_t expected = AMDVM_VMCB_CLEAN_SEG |
+		    AMDVM_VMCB_CLEAN_DT | AMDVM_VMCB_CLEAN_CR |
+		    AMDVM_VMCB_CLEAN_DR | AMDVM_VMCB_CLEAN_CR2;
+		assert((unchanged & expected) == expected);
+		amdvm_x86_guest_state_v1_t changed = input;
+		changed.cr[3] ^= 0x1000u;
+		assert((amdvm_vmcb_state_clean_candidates(vmcb, &changed) &
+		    AMDVM_VMCB_CLEAN_CR) == 0);
+		changed = input;
+		changed.segments[AMDVM_X86_SEG_DS].base++;
+		assert((amdvm_vmcb_state_clean_candidates(vmcb, &changed) &
+		    AMDVM_VMCB_CLEAN_SEG) == 0);
+		changed = input;
+		changed.segments[AMDVM_X86_SEG_IDTR].base++;
+		assert((amdvm_vmcb_state_clean_candidates(vmcb, &changed) &
+		    AMDVM_VMCB_CLEAN_DT) == 0);
+	}
+	{
+		uint16_t saved_cr_read = 0;
+		uint16_t cr_read = 0;
+		const uint16_t cr2_bit = (uint16_t)(1u << AMDVM_VMCB_CR2_INDEX);
+		const uint16_t original_cr_read = (uint16_t)(0xa55au | cr2_bit);
+
+		amdvm_vmcb_set_u16(vmcb, AMDVM_VMCB_INTERCEPT_CR_READ,
+		    original_cr_read);
+		assert(amdvm_vmcb_prepare_native_cr2_read(vmcb,
+		    &saved_cr_read) == 0);
+		memcpy(&cr_read, &vmcb->bytes[AMDVM_VMCB_INTERCEPT_CR_READ],
+		    sizeof(cr_read));
+		assert(saved_cr_read == original_cr_read);
+		assert(cr_read == (uint16_t)(original_cr_read & ~cr2_bit));
+		assert(amdvm_vmcb_prepare_native_cr2_read(vmcb,
+		    &saved_cr_read) != 0);
+		memcpy(&cr_read, &vmcb->bytes[AMDVM_VMCB_INTERCEPT_CR_READ],
+		    sizeof(cr_read));
+		assert(cr_read == (uint16_t)(original_cr_read & ~cr2_bit));
+		amdvm_vmcb_restore_cr2_read_intercept(vmcb, saved_cr_read);
+		memcpy(&cr_read, &vmcb->bytes[AMDVM_VMCB_INTERCEPT_CR_READ],
+		    sizeof(cr_read));
+		assert(cr_read == original_cr_read);
+		/* Missing CR2 intercept must fail without changing other read bits. */
+		saved_cr_read = 0x5aa5u;
+		amdvm_vmcb_set_u16(vmcb, AMDVM_VMCB_INTERCEPT_CR_READ,
+		    (uint16_t)(original_cr_read & ~cr2_bit));
+		assert(amdvm_vmcb_prepare_native_cr2_read(vmcb,
+		    &saved_cr_read) != 0);
+		assert(saved_cr_read == 0x5aa5u);
+		memcpy(&cr_read, &vmcb->bytes[AMDVM_VMCB_INTERCEPT_CR_READ],
+		    sizeof(cr_read));
+		assert(cr_read == (uint16_t)(original_cr_read & ~cr2_bit));
+	}
+	{
+		uint16_t saved_cr_read = 0, saved_cr_write = 0;
+		uint16_t cr_read = UINT16_MAX, cr_write = UINT16_MAX;
+		const uint16_t native_read_mask = (uint16_t)~(1u << 3);
+		const uint16_t native_write_mask = (uint16_t)~(1u << 3);
+
+		amdvm_vmcb_set_u64(vmcb, AMDVM_VMCB_GUEST_CR4, 0);
+		amdvm_vmcb_set_u16(vmcb, AMDVM_VMCB_INTERCEPT_CR_READ, UINT16_MAX);
+		amdvm_vmcb_set_u16(vmcb, AMDVM_VMCB_INTERCEPT_CR_WRITE, UINT16_MAX);
+		assert(amdvm_vmcb_prepare_native_cr3(vmcb, &saved_cr_read,
+		    &saved_cr_write) == 0);
+		memcpy(&cr_read, &vmcb->bytes[AMDVM_VMCB_INTERCEPT_CR_READ],
+		    sizeof(cr_read));
+		memcpy(&cr_write, &vmcb->bytes[AMDVM_VMCB_INTERCEPT_CR_WRITE],
+		    sizeof(cr_write));
+		assert(saved_cr_read == UINT16_MAX && saved_cr_write == UINT16_MAX);
+		assert(cr_read == native_read_mask && cr_write == native_write_mask);
+		amdvm_vmcb_restore_native_cr3(vmcb, saved_cr_read, saved_cr_write);
+		memcpy(&cr_read, &vmcb->bytes[AMDVM_VMCB_INTERCEPT_CR_READ],
+		    sizeof(cr_read));
+		memcpy(&cr_write, &vmcb->bytes[AMDVM_VMCB_INTERCEPT_CR_WRITE],
+		    sizeof(cr_write));
+		assert(cr_read == UINT16_MAX && cr_write == UINT16_MAX);
+		amdvm_vmcb_set_u64(vmcb, AMDVM_VMCB_GUEST_CR4, UINT64_C(1) << 17);
+		assert(amdvm_vmcb_prepare_native_cr3(vmcb, &saved_cr_read,
+		    &saved_cr_write) != 0);
+		amdvm_vmcb_set_u64(vmcb, AMDVM_VMCB_GUEST_CR4, 0);
+	}
+	{
+		amdvm_x86_guest_state_v1_t v3 = input;
+		uint16_t cr_read, cr_write;
+		uint32_t int_ctl;
+
+		v3.abi_version = AMDVM_X86_STATE_ABI_VERSION_V3;
+		v3.cr[1] = 5;
+		assert(amdvm_vmcb_validate_x86_state_v1(&v3) == 0);
+		assert(amdvm_vmcb_load_x86_state_v1(vmcb, &v3, gprs,
+		    guest_xstate, AMDVM_X86_XSTATE_MAX_SIZE) == 0);
+		memcpy(&int_ctl, &vmcb->bytes[AMDVM_VMCB_INTERRUPT_CONTROL],
+		    sizeof(int_ctl));
+		assert((int_ctl & 0x0fu) == 5);
+		memcpy(&cr_read, &vmcb->bytes[AMDVM_VMCB_INTERCEPT_CR_READ],
+		    sizeof(cr_read));
+		memcpy(&cr_write, &vmcb->bytes[AMDVM_VMCB_INTERCEPT_CR_WRITE],
+		    sizeof(cr_write));
+		assert((cr_read & (1u << 8)) == 0);
+		assert((cr_write & (1u << 8)) == 0);
+		assert(amdvm_vmcb_store_x86_state_v1(vmcb, &v3, gprs,
+		    guest_xstate, AMDVM_X86_XSTATE_MAX_SIZE) == 0);
+		assert(v3.cr[1] == 5);
+		v3.cr[1] = 16;
+		assert(amdvm_vmcb_validate_x86_state_v1(&v3) != 0);
+		v3.abi_version = AMDVM_X86_STATE_ABI_VERSION_V2;
+		v3.cr[1] = 1;
+		assert(amdvm_vmcb_validate_x86_state_v1(&v3) != 0);
+	}
 	memcpy(&intercept_misc1,
 	    &vmcb->bytes[AMDVM_VMCB_INTERCEPT_MISC1], sizeof(intercept_misc1));
 	assert((intercept_misc1 & AMDVM_SVM_INTERCEPT_IRET) == 0);
@@ -174,6 +327,24 @@ main(void)
 	    &vmcb->bytes[AMDVM_VMCB_INTERCEPT_EXCEPTIONS],
 	    sizeof(armed_exceptions));
 	assert(armed_exceptions == step_exceptions);
+	/* Diagnostic #PF interception must preserve and exactly restore the
+	 * existing exception mask, including a concurrently armed #DB bit. */
+	uint32_t diagnostic_saved_exceptions = 0;
+	uint32_t diagnostic_pf_mask = UINT32_C(1) << AMDVM_VCPU_EXCEPTION_PF;
+	assert(amdvm_vmcb_add_exception_intercepts(vmcb, diagnostic_pf_mask,
+	    &diagnostic_saved_exceptions) == 0);
+	memcpy(&armed_exceptions,
+	    &vmcb->bytes[AMDVM_VMCB_INTERCEPT_EXCEPTIONS],
+	    sizeof(armed_exceptions));
+	assert(armed_exceptions == (step_exceptions | diagnostic_pf_mask));
+	amdvm_vmcb_restore_exception_intercepts(vmcb,
+	    diagnostic_saved_exceptions);
+	memcpy(&armed_exceptions,
+	    &vmcb->bytes[AMDVM_VMCB_INTERCEPT_EXCEPTIONS],
+	    sizeof(armed_exceptions));
+	assert(armed_exceptions == step_exceptions);
+	assert(amdvm_vmcb_add_exception_intercepts(vmcb, 0,
+	    &diagnostic_saved_exceptions) != 0);
 	input.rflags |= AMDVM_X86_RFLAGS_TF;
 	assert(amdvm_vmcb_arm_nmi_iret_step(vmcb, &input,
 	    &saved_exceptions) != 0);
@@ -202,6 +373,9 @@ main(void)
 	assert(amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_EXIT_INT_INFO) == 0);
 	assert(amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_EXIT_CODE) ==
 	    AMDVM_SVM_EXIT_NOT_RUN);
+	amdvm_vmcb_set_u32(vmcb, AMDVM_VMCB_CLEAN_BITS, UINT32_MAX);
+	amdvm_vmcb_clear_clean_bits(vmcb);
+	assert(amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_CLEAN_BITS) == 0);
 	assert(vmcb->bytes[AMDVM_VMCB_DECODE_ASSIST_LENGTH] == 0);
 	for (unsigned i = 0; i < 15u; ++i) {
 		assert(gprs[i] == staged_request.gpr[i]);

@@ -159,6 +159,7 @@ int main(void)
 	    m->page_pas[2] == 0x2000000 && m->ranges[1].first_page == 2);
 	assert(amdvm_vm_memory_acquire(m, 1) == AMDVM_VM_MEMORY_STALE);
 	assert(amdvm_vm_memory_commit(m, 42) == 0);
+	assert(m->translation_generation == 1);
 	assert(amdvm_vm_memory_commit(m, 43) == AMDVM_VM_MEMORY_INVALID);
 	assert(amdvm_vm_memory_acquire(m, 41) == AMDVM_VM_MEMORY_STALE);
 	assert(amdvm_vm_memory_acquire(m, 42) == 0);
@@ -244,7 +245,8 @@ int main(void)
 	f.fail_unpin = 0;
 	assert(amdvm_vm_memory_close(&m, 0) == 0 && !m); clean(&f);
 
-	/* Immutable ROM aliases may share the same backing pages. */
+	/* Immutable ROM aliases may share backing, and writable aliases are safe
+	 * only when they name the same user pages with identical permissions. */
 	amdvm_vcpu_memory_range_t aliases[2] = { ranges[0], ranges[0] };
 	aliases[0].flags = aliases[1].flags = 5;
 	aliases[1].guest_physical_address = 0x800000;
@@ -252,6 +254,39 @@ int main(void)
 	assert(prepare(&f, &m, aliases, 2) == 0);
 	assert(amdvm_vm_memory_close(&m, 0) == 0); clean(&f);
 	aliases[1].flags = 7;
+	assert(prepare(&f, &m, aliases, 2) == AMDVM_VM_MEMORY_ALIAS);
+	assert(!m); clean(&f);
+	aliases[0] = ranges[0];
+	aliases[1] = ranges[0];
+	aliases[1].guest_physical_address = 0x800000;
+	aliases[1].size = 4096;
+	memset(&f, 0, sizeof(f));
+	assert(prepare(&f, &m, aliases, 2) == 0);
+	assert(m->page_count == 3 && m->page_pas[0] == m->page_pas[2]);
+	assert(m->page_pas[0] != m->page_pas[1]);
+	assert(amdvm_vm_memory_commit(m, 7) == 0);
+	assert(amdvm_vm_memory_acquire(m, 7) == 0);
+	amdvm_npt_t alias_npt = {0};
+	size_t alias_pages = 0;
+	assert(amdvm_vm_npt_required_pages(m, &alias_pages) == 0);
+	void *alias_pool = NULL;
+	uint64_t *alias_pool_pas = calloc(alias_pages, sizeof(*alias_pool_pas));
+	size_t *alias_pool_indexes = calloc(alias_pages, sizeof(*alias_pool_indexes));
+	assert(alias_pool_pas && alias_pool_indexes);
+	assert(posix_memalign(&alias_pool, 4096, alias_pages * 4096) == 0);
+	for (size_t i = 0; i < alias_pages; ++i)
+		alias_pool_pas[i] = 0x3000000u + i * 8192u;
+	assert(amdvm_npt_init_scatter(&alias_npt, alias_pool, alias_pool_pas,
+	    alias_pool_indexes, alias_pages, 48, 48) == 0);
+	assert(amdvm_vm_npt_build(m, &alias_npt, 0x5000000u,
+	    check_npt_pa, NULL) == 0);
+	assert(amdvm_npt_validate_4k_mapping(&alias_npt, 0x800000,
+	    m->page_pas[2], 7) == 0);
+	free(alias_pool); free(alias_pool_pas); free(alias_pool_indexes);
+	assert(amdvm_vm_memory_release(m) == 0);
+	assert(amdvm_vm_memory_close(&m, 0) == 0); clean(&f);
+	aliases[1].user_virtual_address += 0x10000;
+	memset(&f, 0, sizeof(f)); f.alias_pa = 1;
 	assert(prepare(&f, &m, aliases, 2) == AMDVM_VM_MEMORY_ALIAS);
 	assert(!m); clean(&f);
 

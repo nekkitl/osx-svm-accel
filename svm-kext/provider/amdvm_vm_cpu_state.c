@@ -15,14 +15,34 @@ int amdvm_vm_cpu_state_init(amdvm_vm_cpu_state_t *owner,
 	return 0;
 }
 
-int amdvm_vm_cpu_state_set(amdvm_vm_cpu_state_t *owner, amdvm_vmcb_t *vmcb,
-    uint64_t gprs[15], void *xstate, const amdvm_x86_guest_state_v1_t *input)
+static int
+amdvm_vm_cpu_state_set_impl(amdvm_vm_cpu_state_t *owner, amdvm_vmcb_t *vmcb,
+    uint64_t gprs[15], void *xstate, const amdvm_x86_guest_state_v1_t *input,
+    int already_validated)
 {
-	if (!owner || !owner->valid || !input ||
+	if (!owner || !owner->valid || !input) return -1;
+	int status = already_validated ?
+	    amdvm_vmcb_load_x86_state_v1_validated(vmcb, input, gprs, xstate,
+	    AMDVM_X86_XSTATE_MAX_SIZE) :
 	    amdvm_vmcb_load_x86_state_v1(vmcb, input, gprs, xstate,
-	    AMDVM_X86_XSTATE_MAX_SIZE)) return -1;
+	    AMDVM_X86_XSTATE_MAX_SIZE);
+	if (status) return -1;
 	memcpy(&owner->architectural, input, sizeof(*input));
 	return 0;
+}
+
+int
+amdvm_vm_cpu_state_set(amdvm_vm_cpu_state_t *owner, amdvm_vmcb_t *vmcb,
+    uint64_t gprs[15], void *xstate, const amdvm_x86_guest_state_v1_t *input)
+{
+	return amdvm_vm_cpu_state_set_impl(owner, vmcb, gprs, xstate, input, 0);
+}
+
+int
+amdvm_vm_cpu_state_set_validated(amdvm_vm_cpu_state_t *owner, amdvm_vmcb_t *vmcb,
+    uint64_t gprs[15], void *xstate, const amdvm_x86_guest_state_v1_t *input)
+{
+	return amdvm_vm_cpu_state_set_impl(owner, vmcb, gprs, xstate, input, 1);
 }
 
 int amdvm_vm_cpu_state_get(const amdvm_vm_cpu_state_t *owner,

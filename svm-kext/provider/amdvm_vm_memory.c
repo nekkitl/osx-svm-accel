@@ -41,7 +41,7 @@ amdvm_vm_memory_validate(const amdvm_vcpu_memory_range_t *ranges,
 			const amdvm_vcpu_memory_range_t *p = &ranges[j];
 			if (r->user_virtual_address < p->user_virtual_address + p->size &&
 			    p->user_virtual_address < r->user_virtual_address + r->size &&
-			    (r->flags != RX_FLAGS || p->flags != RX_FLAGS))
+			    r->flags != p->flags)
 				return AMDVM_VM_MEMORY_ALIAS;
 		}
 		if (r->size > limits->max_mapped_bytes - mapped)
@@ -169,8 +169,21 @@ amdvm_vm_memory_prepare(amdvm_vm_memory_t **candidate,
 				rc = AMDVM_VM_MEMORY_BAD_PA; goto fail;
 			}
 			m->page_pas[cursor] = pa;
+			uint64_t user_page = ranges[i].user_virtual_address + j * PAGE_BYTES;
+			int backing_aliasable = ranges[i].flags == RX_FLAGS;
+			if (!backing_aliasable) {
+				for (size_t other = 0; other < count; ++other) {
+					const amdvm_vcpu_memory_range_t *r = &ranges[other];
+					if (other != i && r->flags == ranges[i].flags &&
+					    user_page >= r->user_virtual_address &&
+					    user_page - r->user_virtual_address < r->size) {
+						backing_aliasable = 1;
+						break;
+					}
+				}
+			}
 			aliases[cursor++] = ((pa / PAGE_BYTES) << 1) |
-			    (ranges[i].flags == RX_FLAGS);
+			    (uint64_t)backing_aliasable;
 		}
 	}
 	if (amdvm_npt_validate_backing_aliases(aliases, pages) != AMDVM_NPT_OK) {
@@ -191,6 +204,7 @@ amdvm_vm_memory_commit(amdvm_vm_memory_t *m, uint64_t generation)
 	if (!m || m->state != AMDVM_VM_MEMORY_READY || !generation || m->generation)
 		return AMDVM_VM_MEMORY_INVALID;
 	m->generation = generation;
+	m->translation_generation = 1;
 	return AMDVM_VM_MEMORY_OK;
 }
 

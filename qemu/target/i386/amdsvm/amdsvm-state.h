@@ -7,6 +7,7 @@
 #include "amdsvm-msr.h"
 
 struct CPUState;
+struct x86_decode;
 typedef struct Error Error;
 
 /* QEMU's x86 GPR ABI order, kept explicit outside target-private CPU headers. */
@@ -27,6 +28,66 @@ typedef struct Error Error;
 #define AMDSVM_GPR_R14 14u
 #define AMDSVM_GPR_R15 15u
 
+/*
+ * The current AMD-SVM state ABI carries x87, SSE, and AVX XCR0 state only.
+ * Keep intercepted CPUID consistent with that runtime profile so guests do
+ * not enable AVX-512, MPX, PKRU, AMX, CET, or APX state that RUN cannot save.
+ */
+static inline void amdsvm_cpuid_mask_xstate_profile(
+    uint32_t leaf, uint32_t subleaf, uint64_t enabled_xcr0,
+    uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx)
+{
+    if (leaf == 0x0d) {
+        switch (subleaf) {
+        case 0:
+            *eax = 0x7;
+            *edx = 0;
+            *ecx = 0x340; /* standard XSAVE size for x87/SSE/AVX */
+            *ebx = (enabled_xcr0 & 0x4) ? 0x340 : 0x240;
+            break;
+        case 1:
+            /* XSAVEOPT/XSAVEC/XGETBV1 only; hide XSAVES, XFD, reserved bits. */
+            *eax &= 0x7;
+            *ebx = *ecx = *edx = 0;
+            break;
+        case 2:
+            /* YMM state is the one extended component supported. */
+            *eax = 0x100;
+            *ebx = 0x240; /* standard-format offset after the 576-byte header */
+            *ecx = *edx = 0;
+            break;
+        default:
+            *eax = *ebx = *ecx = *edx = 0;
+            break;
+        }
+        return;
+    }
+
+    if (leaf == 7 && subleaf == 0) {
+        *ebx &= ~((1u << 14) | (1u << 16) | (1u << 17) | (1u << 21) |
+                  (1u << 26) | (1u << 27) | (1u << 28) | (1u << 30) |
+                  (1u << 31)); /* MPX and AVX-512 */
+        *ecx &= ~((1u << 1) | (1u << 3) | (1u << 4) | (1u << 6) |
+                  (1u << 7) | (1u << 11) | (1u << 12) | (1u << 14) |
+                  (1u << 31)); /* AVX-512, PKU/PKS, CET shadow stack */
+        *edx &= ~((1u << 2) | (1u << 3) | (1u << 8) | (1u << 19) |
+                  (1u << 20) | (1u << 22) | (1u << 23) | (1u << 24) |
+                  (1u << 25)); /* AVX-512, CET IBT, and AMX */
+        return;
+    }
+
+    if (leaf == 7 && subleaf == 1) {
+        *eax &= ~((1u << 5) | (1u << 21)); /* AVX-512 BF16 and AMX-FP16 */
+        *edx &= ~((1u << 8) | (1u << 19) | (1u << 21));
+        return; /* AMX-COMPLEX, AVX10, and APX */
+    }
+
+    if (leaf == 0x1d || leaf == 0x1e || leaf == 0x24) {
+        /* AMX tile description and AVX10 capability leaves. */
+        *eax = *ebx = *ecx = *edx = 0;
+    }
+}
+
 static inline bool amdsvm_xsetbv_value_valid(uint64_t value, uint32_t index,
                                             unsigned cpl, uint64_t supported)
 {
@@ -40,7 +101,12 @@ static inline bool amdsvm_xsetbv_value_valid(uint64_t value, uint32_t index,
  */
 int amdsvm_state_load(struct CPUState *cpu,
                       amdvm_x86_guest_state_v1_t *state);
+/* Select the wire state version once per VM; v2 remains the fallback. */
+int amdsvm_state_set_abi_version(uint32_t abi_version);
+uint32_t amdsvm_state_get_abi_version(void);
 uint32_t amdsvm_state_apic_id(struct CPUState *cpu);
+uint32_t amdsvm_state_phys_bits(struct CPUState *cpu);
+uint32_t amdsvm_state_host_phys_bits(void);
 
 /* Apply a provider VMEXIT snapshot to QEMU's architectural state. */
 int amdsvm_state_store(struct CPUState *cpu,
@@ -48,6 +114,8 @@ int amdsvm_state_store(struct CPUState *cpu,
 int amdsvm_handle_xsetbv_exit(struct CPUState *cpu, uint64_t next_rip,
                                uint32_t *event_injection);
 int amdsvm_state_read_tsc(struct CPUState *cpu, uint64_t *value);
+int amdsvm_state_get_native_tsc_offset(struct CPUState *cpu, uint64_t *offset);
+int amdsvm_state_read_tsc_aux(struct CPUState *cpu, uint32_t *value);
 int amdsvm_handle_ioio_string_exit(
     struct CPUState *cpu, uint64_t exit_info1, uint64_t next_rip,
     amdvm_x86_guest_state_v1_t *updated_state, Error **errp);
@@ -62,6 +130,10 @@ int amdsvm_handle_npf_write_exit(
     const uint8_t instruction_bytes[15], uint8_t instruction_length,
     uint64_t immutable_rom_bytes, uint64_t shadow_backing_hva,
     uint64_t shadow_backing_bytes, Error **errp);
+/* True when QEMU's interpreter can safely execute a non-LOCK MMIO RMW. */
+bool amdsvm_state_npf_mmio_rmw_supported(const struct x86_decode *decode);
+/* True for bounded read-only MMIO TEST operations using QEMU's interpreter. */
+bool amdsvm_state_npf_mmio_read_supported(const struct x86_decode *decode);
 
 /* Validate state without mutating QEMU or entering the provider. */
 int amdsvm_state_validate(const amdvm_x86_guest_state_v1_t *state);

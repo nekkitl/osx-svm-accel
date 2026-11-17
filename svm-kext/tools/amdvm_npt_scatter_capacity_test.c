@@ -1,4 +1,4 @@
-/* Offline, software-only allocation/translation test for the 2 GiB NPT pool. */
+/* Offline, software-only allocation/translation test for 2-16 GiB guest RAM. */
 #include "../provider/amdvm_npt.h"
 #include "../amdvm_probe_abi.h"
 
@@ -43,7 +43,9 @@ check_scatter_ram_size(uint64_t ram_bytes, unsigned gib)
 	}
 	assert(amdvm_npt_required_pages(ranges, range_count, 48u, &pool_pages) ==
 	    AMDVM_NPT_OK);
-	assert(pool_pages == (gib == 2u ? 1030u : 4108u));
+	if (gib == 2u) assert(pool_pages == 1030u);
+	else if (gib == 8u) assert(pool_pages == 4108u);
+	else assert(gib >= 12u && pool_pages > 4108u);
 	assert(posix_memalign((void **)&pool, PAGE_SIZE,
 	    pool_pages * PAGE_SIZE) == 0);
 	pool_pas = (uint64_t *)calloc(pool_pages, sizeof(*pool_pas));
@@ -100,5 +102,7 @@ main(void)
 {
 	check_scatter_ram_size(UINT64_C(2) * 1024u * 1024u * 1024u, 2u);
 	check_scatter_ram_size(UINT64_C(8) * 1024u * 1024u * 1024u, 8u);
+	check_scatter_ram_size(UINT64_C(12) * 1024u * 1024u * 1024u, 12u);
+	check_scatter_ram_size(UINT64_C(16) * 1024u * 1024u * 1024u, 16u);
 	return 0;
 }

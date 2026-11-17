@@ -2,19 +2,27 @@
 #define QEMU_AMDSVM_VM_PROVIDER_H
 #include "amdsvm-provider-lifecycle.h"
 #include "../../../svm-kext/amdvm_vm_abi_draft.h"
+#include "../../../svm-kext/amdvm_vm_shared_run.h"
 
 /* Resource preparation is BQL-serialized; RUN is one call per vCPU thread. */
 typedef struct AMDVMVMProvider {
     AMDVMProviderTransport transport;
     void *opaque;
     amdvm_vm_abi_draft_negotiate_result_t caps;
+    uint32_t state_abi;
     uint64_t generation;
     bool may_exist;
     bool mapped;
+    bool diagnostic_gp_intercept;
+    bool diagnostic_pf_intercept;
+    bool mtrr_cache_enabled;
+    bool provider_pause_enabled;
     bool cpus[AMDVM_VM_ABI_DRAFT_MAX_VCPUS];
     uint64_t kick_generation[AMDVM_VM_ABI_DRAFT_MAX_VCPUS];
     uint32_t run_active[AMDVM_VM_ABI_DRAFT_MAX_VCPUS];
     uint32_t operation_gate;
+    amdvm_vm_shared_run_area_t *shared_run_area;
+    uint64_t shared_run_sequence[AMDVM_VM_ABI_DRAFT_MAX_VCPUS];
 } AMDVMVMProvider;
 int amdsvm_vm_provider_init(AMDVMVMProvider *, AMDVMProviderTransport, void *);
 int amdsvm_vm_provider_map(AMDVMVMProvider *, const uint8_t rom[4096],
@@ -28,14 +36,25 @@ int amdsvm_vm_provider_state_roundtrip(AMDVMVMProvider *, uint32_t id,
 int amdsvm_vm_provider_diagnostic(AMDVMVMProvider *, uint32_t id,
                                   amdvm_vm_abi_draft_vcpu_diagnostic_result_t *);
 int amdsvm_vm_provider_kick(AMDVMVMProvider *, uint32_t id,
-                            uint64_t kick_generation);
+                            uint64_t kick_generation,
+                            uint64_t *latched_generation);
 bool amdsvm_vm_provider_supports_kick(const AMDVMVMProvider *);
+int amdsvm_vm_provider_report_pause_stats(AMDVMVMProvider *);
 int amdsvm_vm_provider_run(AMDVMVMProvider *, uint32_t id,
                            uint64_t kick_generation,
                            uint32_t event_injection,
                            uint32_t event_injection_error_code,
+                           bool native_rdtsc, uint64_t tsc_offset,
                            const amdvm_x86_guest_state_v1_t *,
                            amdvm_vm_abi_draft_vcpu_run_result_t *);
+int amdsvm_vm_provider_run_ex(AMDVMVMProvider *, uint32_t id,
+                              uint64_t kick_generation,
+                              uint32_t event_injection,
+                              uint32_t event_injection_error_code,
+                              bool native_rdtsc, uint64_t tsc_offset,
+                              bool native_cr3,
+                              const amdvm_x86_guest_state_v1_t *,
+                              amdvm_vm_abi_draft_vcpu_run_result_t *);
 int amdsvm_vm_provider_set_memory_types(
     AMDVMVMProvider *, uint32_t id,
     const amdvm_vcpu_set_memory_types_request_t *);

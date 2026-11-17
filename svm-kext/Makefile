@@ -3,7 +3,7 @@ KERNEL_HEADERS := $(SDK)/System/Library/Frameworks/Kernel.framework/Headers
 BUILD := build
 KEXT := $(BUILD)/AMDVMProbe.kext
 OPT_IN_AUDIT := $(BUILD)/opt-in-audit
-XNU_KPI_EXPORTS ?=
+XNU_KPI_EXPORTS ?= ../../xnu/BUILD/obj/DEVELOPMENT_X86_64/all-kpi.exp
 AMDVM_XNU_PROFILE ?= stock
 
 KEXT_CXXFLAGS := -arch x86_64 -mkernel -fapple-kext -fno-exceptions -fno-rtti \
@@ -26,11 +26,41 @@ KEXT_CFLAGS += -DAMDVM_SVM_RUN_EXPERIMENTAL_OPT_IN=1
 KEXT_CXXFLAGS += -DAMDVM_SVM_RUN_EXPERIMENTAL_OPT_IN=1
 endif
 
-# VM-scoped hardware RUN/KICK remain opt-in. This switch only compiles
-# entry support; building does not sign, install, load or execute the kext.
+# VM-scoped RUN/KICK are present for offline ABI work, but must remain
+# unreachable from IOUserClient until the host IPI/TLB stop gate is proven.
 ifeq ($(AMDVM_EXPERIMENTAL_VM_API_RUN),1)
 	KEXT_CFLAGS += -DAMDVM_VM_API_RUN_EXPERIMENTAL=1
 	KEXT_CXXFLAGS += -DAMDVM_VM_API_RUN_EXPERIMENTAL=1
+endif
+
+ifeq ($(AMDVM_EXPERIMENTAL_NATIVE_CR2_READ),1)
+	KEXT_CFLAGS += -DAMDVM_EXPERIMENTAL_NATIVE_CR2_READ=1
+	KEXT_CXXFLAGS += -DAMDVM_EXPERIMENTAL_NATIVE_CR2_READ=1
+endif
+
+ifeq ($(AMDVM_EXPERIMENTAL_NATIVE_CR3),1)
+	KEXT_CFLAGS += -DAMDVM_EXPERIMENTAL_NATIVE_CR3=1
+	KEXT_CXXFLAGS += -DAMDVM_EXPERIMENTAL_NATIVE_CR3=1
+endif
+
+ifeq ($(AMDVM_EXPERIMENTAL_PROVIDER_PAUSE),1)
+	KEXT_CFLAGS += -DAMDVM_EXPERIMENTAL_PROVIDER_PAUSE=1
+	KEXT_CXXFLAGS += -DAMDVM_EXPERIMENTAL_PROVIDER_PAUSE=1
+endif
+
+ifeq ($(AMDVM_EXPERIMENTAL_PROVIDER_TIMING),1)
+	KEXT_CFLAGS += -DAMDVM_EXPERIMENTAL_PROVIDER_TIMING=1
+	KEXT_CXXFLAGS += -DAMDVM_EXPERIMENTAL_PROVIDER_TIMING=1
+endif
+
+ifeq ($(AMDVM_EXPERIMENTAL_SHARED_RUN),1)
+	KEXT_CFLAGS += -DAMDVM_EXPERIMENTAL_SHARED_RUN=1
+	KEXT_CXXFLAGS += -DAMDVM_EXPERIMENTAL_SHARED_RUN=1
+endif
+
+ifeq ($(AMDVM_EXPERIMENTAL_NATIVE_RDTSC),1)
+	KEXT_CFLAGS += -DAMDVM_EXPERIMENTAL_NATIVE_RDTSC=1
+	KEXT_CXXFLAGS += -DAMDVM_EXPERIMENTAL_NATIVE_RDTSC=1
 endif
 
 .PHONY: all clean opt-in-object-audit hlt-run-candidate hlt-run-kpi-audit
@@ -38,6 +68,8 @@ endif
 .PHONY: stock-xnu-kpi-audit patched-xnu-kpi-audit
 
 .PHONY: npt-isolation-test vmcb-state-roundtrip-test quarantine-owner-test
+.PHONY: tlb-policy-test
+.PHONY: pause-fastpath-test
 .PHONY: npt-capacity-test npt-scatter-capacity-test
 .PHONY: guest-memory-accounting-test
 .PHONY: event-injection-test
@@ -56,6 +88,14 @@ endif
 .PHONY: vm-memory-test vm-memory-kernel-compile vm-memory-cli-test
 .PHONY: vm-memory-4g-npt-test
 .PHONY: vm-cpu-state-test
+.PHONY: vm-cpu-state-bench
+.PHONY: vm-run-buffer-test
+.PHONY: run-slot-lifetime-test
+.PHONY: xstate-capture-policy-test
+.PHONY: xsave-microbench
+.PHONY: vmcb-clean-policy-test
+.PHONY: vm-shared-run-test
+.PHONY: asid-caps-cache-test
 vm-cpu-state-test: | $(BUILD)
 	xcrun --sdk macosx clang -arch x86_64 -std=c11 -g -O1 \
 		-Wall -Wextra -Werror -fsanitize=address,undefined \
@@ -63,6 +103,65 @@ vm-cpu-state-test: | $(BUILD)
 		provider/amdvm_vmcb.c provider/amdvm_xstate.c provider/amdvm_npt.c \
 		-o $(BUILD)/amdvm-vm-cpu-state-test
 	$(BUILD)/amdvm-vm-cpu-state-test
+
+vm-cpu-state-bench: | $(BUILD)
+	xcrun --sdk macosx clang -arch x86_64 -std=c11 -O2 \
+		-Wall -Wextra -Werror -Iprovider \
+		../tools/amdvm_vm_cpu_state_bench.c provider/amdvm_vm_cpu_state.c \
+		provider/amdvm_vmcb.c provider/amdvm_xstate.c provider/amdvm_npt.c \
+		-o $(BUILD)/amdvm-vm-cpu-state-bench
+	$(BUILD)/amdvm-vm-cpu-state-bench
+
+vm-run-buffer-test: | $(BUILD)
+	xcrun --sdk macosx clang -arch x86_64 -std=c11 -g -O1 \
+		-Wall -Wextra -Werror -fsanitize=address,undefined \
+		../tools/amdvm_run_buffer_test.c -o $(BUILD)/amdvm-vm-run-buffer-test
+	$(BUILD)/amdvm-vm-run-buffer-test
+
+run-slot-lifetime-test: | $(BUILD)
+	xcrun --sdk macosx clang -arch x86_64 -std=c11 -g -O1 \
+		-Wall -Wextra -Werror -fsanitize=address,undefined -pthread \
+		 tools/amdvm_run_slot_lifetime_test.c \
+		-o $(BUILD)/amdvm-run-slot-lifetime-test
+	$(BUILD)/amdvm-run-slot-lifetime-test
+
+xstate-capture-policy-test: | $(BUILD)
+	xcrun --sdk macosx clang -arch x86_64 -std=c11 -g -O1 \
+		-Wall -Wextra -Werror -fsanitize=address,undefined \
+		../tools/amdvm_xstate_capture_policy_test.c \
+		-o $(BUILD)/amdvm-xstate-capture-policy-test
+	$(BUILD)/amdvm-xstate-capture-policy-test
+
+xsave-microbench: | $(BUILD)
+	xcrun --sdk macosx clang -arch x86_64 -std=c11 -O2 \
+		-Wall -Wextra -Werror ../tools/amdvm_xsave_microbench.c \
+		-o $(BUILD)/amdvm-xsave-microbench
+	$(BUILD)/amdvm-xsave-microbench
+
+vm-shared-run-test: | $(BUILD)
+	xcrun --sdk macosx clang -arch x86_64 -std=c11 -g -O1 \
+		-Wall -Wextra -Werror -fsanitize=address,undefined \
+		../tools/amdvm_vm_shared_run_test.c -o $(BUILD)/amdvm-vm-shared-run-test
+	$(BUILD)/amdvm-vm-shared-run-test
+
+vmcb-clean-policy-test: | $(BUILD)
+	xcrun --sdk macosx clang -arch x86_64 -std=c11 -g -O1 \
+		-Wall -Wextra -Werror -fsanitize=address,undefined \
+		../tools/amdvm_vmcb_clean_policy_test.c \
+		-o $(BUILD)/amdvm-vmcb-clean-policy-test
+	$(BUILD)/amdvm-vmcb-clean-policy-test
+
+asid-caps-cache-test: | $(BUILD)
+	xcrun --sdk macosx clang -arch x86_64 -std=c11 -g -O1 \
+		-Wall -Wextra -Werror -fsanitize=address,undefined \
+		../tools/amdvm_asid_caps_cache_test.c -o $(BUILD)/amdvm-asid-caps-cache-test
+	$(BUILD)/amdvm-asid-caps-cache-test
+
+pause-fastpath-test: | $(BUILD)
+	xcrun --sdk macosx clang -arch x86_64 -std=c11 -g -O1 \
+		-Wall -Wextra -Werror -fsanitize=address,undefined \
+		../tools/amdvm_pause_fastpath_test.c -o $(BUILD)/amdvm-pause-fastpath-test
+	$(BUILD)/amdvm-pause-fastpath-test
 
 vm-memory-cli-test: | $(BUILD)
 	xcrun --sdk macosx clang -arch x86_64 -std=c11 -g -O1 \
@@ -189,6 +288,13 @@ vmcb-state-roundtrip-test: | $(BUILD)
 		-o $(BUILD)/amdvm-vmcb-state-roundtrip-test
 	$(BUILD)/amdvm-vmcb-state-roundtrip-test
 
+tlb-policy-test: | $(BUILD)
+	xcrun --sdk macosx clang -arch x86_64 -std=c11 -g -O1 \
+		-Wall -Wextra -Werror -fsanitize=address,undefined \
+		../tools/amdvm_tlb_policy_test.c provider/amdvm_tlb_policy.c \
+		-o $(BUILD)/amdvm-tlb-policy-test
+	$(BUILD)/amdvm-tlb-policy-test
+
 quarantine-owner-test: | $(BUILD)
 	xcrun --sdk macosx clang -arch x86_64 -std=c11 -g -O1 \
 		-Wall -Wextra -Werror -fsanitize=address,undefined \
@@ -261,7 +367,8 @@ provider-primitives: $(BUILD)/provider/amdvm_npt.o $(BUILD)/provider/amdvm_vmcb.
 	$(BUILD)/provider/amdvm_vmrun.o $(BUILD)/provider/amdvm_vmrun_x86_64.o \
 	$(BUILD)/provider/amdvm_xstate.o \
 	$(BUILD)/provider/amdvm_physmem.o $(BUILD)/provider/amdvm_svm_owner.o \
-	$(BUILD)/provider/amdvm_hlt_context.o $(BUILD)/provider/amdvm_guest_memory.o \
+	$(BUILD)/provider/amdvm_hlt_context.o $(BUILD)/provider/amdvm_tlb_policy.o \
+	$(BUILD)/provider/amdvm_guest_memory.o \
 	$(BUILD)/provider/amdvm_host_mtrr.o $(BUILD)/provider/amdvm_client_mode.o \
 	$(BUILD)/provider/amdvm_quarantine.o
 
@@ -269,6 +376,7 @@ provider-primitives: $(BUILD)/provider/amdvm_npt.o $(BUILD)/provider/amdvm_vmcb.
 # This target never links a kext, stages files, or runs SVM instructions.
 opt-in-object-audit: $(OPT_IN_AUDIT)/amdvm_vmrun.o \
 		$(OPT_IN_AUDIT)/amdvm_hlt_context.o \
+		$(OPT_IN_AUDIT)/amdvm_tlb_policy.o \
 		$(OPT_IN_AUDIT)/amdvm_svm_owner.o
 
 # Build a separate run-enabled candidate bundle; this target never stages,
@@ -299,7 +407,10 @@ $(OPT_IN_AUDIT):
 $(OPT_IN_AUDIT)/amdvm_vmrun.o: provider/amdvm_vmrun.c provider/amdvm_vmrun.h provider/amdvm_vmcb.h provider/amdvm_physmem.h provider/amdvm_vmrun_asm.h | $(OPT_IN_AUDIT)
 	xcrun --sdk macosx clang $(KEXT_CFLAGS) -std=c11 -Iprovider -DAMDVM_SVM_RUN_EXPERIMENTAL_OPT_IN=1 -c $< -o $@
 
-$(OPT_IN_AUDIT)/amdvm_hlt_context.o: provider/amdvm_hlt_context.c provider/amdvm_hlt_context.h provider/amdvm_host_mtrr.h provider/amdvm_quarantine.h provider/amdvm_npt.h provider/amdvm_physmem.h provider/amdvm_vmcb.h provider/amdvm_vmrun.h | $(OPT_IN_AUDIT)
+$(OPT_IN_AUDIT)/amdvm_hlt_context.o: provider/amdvm_hlt_context.c provider/amdvm_hlt_context.h provider/amdvm_asid_caps_cache.h provider/amdvm_tlb_policy.h provider/amdvm_host_mtrr.h provider/amdvm_quarantine.h provider/amdvm_npt.h provider/amdvm_physmem.h provider/amdvm_vmcb.h provider/amdvm_vmrun.h | $(OPT_IN_AUDIT)
+	xcrun --sdk macosx clang $(KEXT_CFLAGS) -std=c11 -Iprovider -DAMDVM_SVM_RUN_EXPERIMENTAL_OPT_IN=1 -c $< -o $@
+
+$(OPT_IN_AUDIT)/amdvm_tlb_policy.o: provider/amdvm_tlb_policy.c provider/amdvm_tlb_policy.h | $(OPT_IN_AUDIT)
 	xcrun --sdk macosx clang $(KEXT_CFLAGS) -std=c11 -Iprovider -DAMDVM_SVM_RUN_EXPERIMENTAL_OPT_IN=1 -c $< -o $@
 
 $(OPT_IN_AUDIT)/amdvm_svm_owner.o: provider/amdvm_svm_owner.c provider/amdvm_svm_owner.h provider/amdvm_physmem.h provider/amdvm_vmcb.h | $(OPT_IN_AUDIT)
@@ -329,7 +440,10 @@ $(BUILD)/provider/amdvm_physmem.o: provider/amdvm_physmem.cpp provider/amdvm_phy
 $(BUILD)/provider/amdvm_svm_owner.o: provider/amdvm_svm_owner.c provider/amdvm_svm_owner.h provider/amdvm_physmem.h provider/amdvm_vmcb.h | $(BUILD)/provider
 	xcrun --sdk macosx clang $(KEXT_CFLAGS) -std=c11 -Iprovider -c $< -o $@
 
-$(BUILD)/provider/amdvm_hlt_context.o: provider/amdvm_hlt_context.c provider/amdvm_hlt_context.h provider/amdvm_guest_memory.h provider/amdvm_host_mtrr.h provider/amdvm_quarantine.h provider/amdvm_npt.h provider/amdvm_vm_npt.h provider/amdvm_vm_memory.h provider/amdvm_physmem.h provider/amdvm_vmcb.h provider/amdvm_vmrun.h | $(BUILD)/provider
+$(BUILD)/provider/amdvm_hlt_context.o: provider/amdvm_hlt_context.c provider/amdvm_hlt_context.h provider/amdvm_asid_caps_cache.h provider/amdvm_tlb_policy.h provider/amdvm_guest_memory.h provider/amdvm_host_mtrr.h provider/amdvm_quarantine.h provider/amdvm_npt.h provider/amdvm_vm_npt.h provider/amdvm_vm_memory.h provider/amdvm_physmem.h provider/amdvm_vmcb.h provider/amdvm_vmrun.h | $(BUILD)/provider
+	xcrun --sdk macosx clang $(KEXT_CFLAGS) -std=c11 -Iprovider -c $< -o $@
+
+$(BUILD)/provider/amdvm_tlb_policy.o: provider/amdvm_tlb_policy.c provider/amdvm_tlb_policy.h | $(BUILD)/provider
 	xcrun --sdk macosx clang $(KEXT_CFLAGS) -std=c11 -Iprovider -c $< -o $@
 
 $(BUILD)/provider/amdvm_guest_memory.o: provider/amdvm_guest_memory.c provider/amdvm_guest_memory.h amdvm_probe_abi.h | $(BUILD)/provider
@@ -367,7 +481,10 @@ $(BUILD)/AMDVMProbe.o: AMDVMProbe.cpp amdvm_probe_abi.h \
 		provider/amdvm_physmem.h provider/amdvm_svm_owner.h \
 		provider/amdvm_vmcb.h provider/amdvm_vmrun.h \
 		provider/amdvm_client_mode.h provider/amdvm_vm_negotiate.h \
-		provider/amdvm_vm_memory.h provider/amdvm_vm_cpu_state.h amdvm_vm_abi_draft.h | $(BUILD)
+		provider/amdvm_vm_memory.h provider/amdvm_vm_cpu_state.h \
+		provider/amdvm_pause_fastpath.h provider/amdvm_run_buffer.h \
+		provider/amdvm_run_slot_lifetime.h \
+		amdvm_vm_abi_draft.h | $(BUILD)
 	xcrun --sdk macosx clang++ $(KEXT_CXXFLAGS) -c $< -o $@
 
 $(KEXT)/Contents/MacOS/AMDVMProbe: $(BUILD)/AMDVMProbe.o \
@@ -379,6 +496,7 @@ $(KEXT)/Contents/MacOS/AMDVMProbe: $(BUILD)/AMDVMProbe.o \
 		$(BUILD)/provider/amdvm_physmem.o \
 		$(BUILD)/provider/amdvm_svm_owner.o \
 		$(BUILD)/provider/amdvm_hlt_context.o \
+		$(BUILD)/provider/amdvm_tlb_policy.o \
 		$(BUILD)/provider/amdvm_guest_memory.o \
 		$(BUILD)/provider/amdvm_quarantine.o \
 		$(BUILD)/provider/amdvm_host_mtrr.o \
@@ -400,6 +518,7 @@ $(KEXT)/Contents/MacOS/AMDVMProbe: $(BUILD)/AMDVMProbe.o \
 		$(BUILD)/provider/amdvm_physmem.o \
 		$(BUILD)/provider/amdvm_svm_owner.o \
 		$(BUILD)/provider/amdvm_hlt_context.o \
+		$(BUILD)/provider/amdvm_tlb_policy.o \
 		$(BUILD)/provider/amdvm_guest_memory.o \
 		$(BUILD)/provider/amdvm_quarantine.o \
 		$(BUILD)/provider/amdvm_host_mtrr.o \
@@ -420,6 +539,15 @@ clean:
 
 .PHONY: experimental-candidate offline-checks
 experimental-candidate:
-	$(MAKE) BUILD=build/experimental AMDVM_XNU_PROFILE=stock AMDVM_EXPERIMENTAL_HLT_RUN=1 AMDVM_EXPERIMENTAL_VM_API_RUN=1 all
+	$(MAKE) BUILD=build/experimental AMDVM_XNU_PROFILE=stock \
+	    AMDVM_EXPERIMENTAL_HLT_RUN=1 AMDVM_EXPERIMENTAL_VM_API_RUN=1 \
+	    AMDVM_EXPERIMENTAL_NATIVE_CR3=1 AMDVM_EXPERIMENTAL_PROVIDER_PAUSE=1 all
 
-offline-checks: vm-abi-draft-layout-test client-mode-test vm-negotiate-test vm-memory-test vm-memory-4g-npt-test vm-cpu-state-test vmcb-state-roundtrip-test npt-isolation-test event-state-test host-mtrr-test physmem-unpin-test
+offline-checks: vm-cpu-state-test vm-run-buffer-test run-slot-lifetime-test xstate-capture-policy-test \
+	vm-shared-run-test vmcb-clean-policy-test asid-caps-cache-test pause-fastpath-test \
+	vm-memory-cli-test vm-memory-test vm-memory-4g-npt-test vcpu-lifecycle-test \
+	vm-lifecycle-model-test vm-abi-draft-layout-test client-mode-test vm-negotiate-test \
+	entry-snapshot-test npt-isolation-test npt-capacity-test npt-scatter-capacity-test \
+	guest-memory-accounting-test vmcb-state-roundtrip-test tlb-policy-test quarantine-owner-test \
+	physmem-unpin-test quarantine-registry-test kick-logic-test event-injection-test \
+	event-state-test msr-helpers-test host-mtrr-test npt-pat-transaction-test

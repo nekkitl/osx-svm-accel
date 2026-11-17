@@ -10,6 +10,8 @@
 #define AMDVM_GUEST_DR6_RESET    0xffff0ff0ull
 #define AMDVM_GUEST_DR7_RESET    0x00000400ull
 #define AMDVM_GUEST_RFLAGS_FIXED 0x00000002ull
+#define AMDVM_VMCB_V_TPR_MASK    0x0fu
+#define AMDVM_VMCB_CR8_BIT       8u
 
 /* VMCB segment attributes use descriptor bits 11:0; bits 15:12 are reserved. */
 #define AMDVM_SEG_ATTR_CODE_16       0x09bu
@@ -21,9 +23,75 @@
 #define AMDVM_CR0_CD                 (1ull << 30)
 #define AMDVM_CR0_PG                 (1ull << 31)
 #define AMDVM_CR4_PAE                (1ull << 5)
+#define AMDVM_CR4_PCIDE               (1ull << 17)
 #define AMDVM_EFER_LME               (1ull << 8)
 #define AMDVM_RFLAGS_RESERVED_MASK   ((1ull << 3) | (1ull << 5) | \
 	(1ull << 15) | (0xffffffffffc00000ull))
+
+static int
+amdvm_vmcb_cr8_intercepts(amdvm_vmcb_t *vmcb, int intercept)
+{
+	uint16_t read, write;
+
+	if (vmcb == NULL) {
+		return -1;
+	}
+	memcpy(&read, &vmcb->bytes[AMDVM_VMCB_INTERCEPT_CR_READ],
+	    sizeof(read));
+	memcpy(&write, &vmcb->bytes[AMDVM_VMCB_INTERCEPT_CR_WRITE],
+	    sizeof(write));
+	if (intercept) {
+		read |= (uint16_t)(1u << AMDVM_VMCB_CR8_BIT);
+		write |= (uint16_t)(1u << AMDVM_VMCB_CR8_BIT);
+	} else {
+		read &= (uint16_t)~(1u << AMDVM_VMCB_CR8_BIT);
+		write &= (uint16_t)~(1u << AMDVM_VMCB_CR8_BIT);
+	}
+	amdvm_vmcb_set_u16(vmcb, AMDVM_VMCB_INTERCEPT_CR_READ, read);
+	amdvm_vmcb_set_u16(vmcb, AMDVM_VMCB_INTERCEPT_CR_WRITE, write);
+	return 0;
+}
+
+static int
+amdvm_vmcb_apply_vtpr(amdvm_vmcb_t *vmcb, uint64_t cr8)
+{
+	uint32_t int_ctl;
+
+	if (vmcb == NULL || !AMDVM_X86_STATE_CR8_VALID(cr8)) {
+		return -1;
+	}
+	memcpy(&int_ctl, &vmcb->bytes[AMDVM_VMCB_INTERRUPT_CONTROL],
+	    sizeof(int_ctl));
+	int_ctl = (int_ctl & ~AMDVM_VMCB_V_TPR_MASK) |
+	    ((uint32_t)cr8 & AMDVM_VMCB_V_TPR_MASK);
+	amdvm_vmcb_set_u32(vmcb, AMDVM_VMCB_INTERRUPT_CONTROL, int_ctl);
+	return 0;
+}
+
+static uint64_t
+amdvm_vmcb_read_vtpr(const amdvm_vmcb_t *vmcb)
+{
+	uint32_t int_ctl;
+
+	if (vmcb == NULL) {
+		return 0;
+	}
+	memcpy(&int_ctl, &vmcb->bytes[AMDVM_VMCB_INTERRUPT_CONTROL],
+	    sizeof(int_ctl));
+	return int_ctl & AMDVM_VMCB_V_TPR_MASK;
+}
+
+static int
+amdvm_vmcb_state_cr8_valid(const struct amdvm_x86_guest_state_v1 *state)
+{
+	if (state == NULL || !amdvm_x86_state_abi_supported(state->abi_version)) {
+		return 0;
+	}
+	if (state->abi_version == AMDVM_X86_STATE_ABI_VERSION_V3) {
+		return AMDVM_X86_STATE_CR8_VALID(state->cr[1]);
+	}
+	return state->cr[1] == 0;
+}
 
 static const uint32_t amdvm_x86_segment_offsets[AMDVM_X86_SEGMENT_COUNT] = {
 	AMDVM_VMCB_GUEST_ES, AMDVM_VMCB_GUEST_CS, AMDVM_VMCB_GUEST_SS,
@@ -31,6 +99,71 @@ static const uint32_t amdvm_x86_segment_offsets[AMDVM_X86_SEGMENT_COUNT] = {
 	AMDVM_VMCB_GUEST_GDTR, AMDVM_VMCB_GUEST_LDTR,
 	AMDVM_VMCB_GUEST_IDTR, AMDVM_VMCB_GUEST_TR
 };
+
+static int
+amdvm_vmcb_segment_matches(const amdvm_vmcb_t *vmcb, uint32_t offset,
+	const amdvm_x86_segment_state_t *segment)
+{
+	uint16_t selector, attributes;
+	uint32_t limit;
+	uint64_t base;
+	memcpy(&selector, &vmcb->bytes[offset], sizeof(selector));
+	memcpy(&attributes, &vmcb->bytes[offset + 2u], sizeof(attributes));
+	memcpy(&limit, &vmcb->bytes[offset + 4u], sizeof(limit));
+	memcpy(&base, &vmcb->bytes[offset + 8u], sizeof(base));
+	return selector == segment->selector && attributes == segment->attributes &&
+	    limit == segment->limit && base == segment->base;
+}
+
+uint32_t
+amdvm_vmcb_state_clean_candidates(const amdvm_vmcb_t *vmcb,
+	const struct amdvm_x86_guest_state_v1 *state)
+{
+	uint32_t candidates = 0;
+	uint32_t gdtr_limit, idtr_limit;
+	uint8_t cpl;
+	if (vmcb == NULL || state == NULL) return 0;
+
+	if (amdvm_vmcb_segment_matches(vmcb, AMDVM_VMCB_GUEST_ES,
+	    &state->segments[AMDVM_X86_SEG_ES]) &&
+	    amdvm_vmcb_segment_matches(vmcb, AMDVM_VMCB_GUEST_CS,
+	    &state->segments[AMDVM_X86_SEG_CS]) &&
+	    amdvm_vmcb_segment_matches(vmcb, AMDVM_VMCB_GUEST_SS,
+	    &state->segments[AMDVM_X86_SEG_SS]) &&
+	    amdvm_vmcb_segment_matches(vmcb, AMDVM_VMCB_GUEST_DS,
+	    &state->segments[AMDVM_X86_SEG_DS])) {
+		cpl = (uint8_t)((state->segments[AMDVM_X86_SEG_CS].attributes >> 5) & 3u);
+		if (vmcb->bytes[AMDVM_VMCB_GUEST_CPL] == cpl)
+			candidates |= AMDVM_VMCB_CLEAN_SEG;
+	}
+
+	memcpy(&gdtr_limit, &vmcb->bytes[AMDVM_VMCB_GUEST_GDTR + 4u],
+	    sizeof(gdtr_limit));
+	memcpy(&idtr_limit, &vmcb->bytes[AMDVM_VMCB_GUEST_IDTR + 4u],
+	    sizeof(idtr_limit));
+	if (gdtr_limit ==
+	    state->segments[AMDVM_X86_SEG_GDTR].limit &&
+	    amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_GUEST_GDTR + 8u) ==
+	    state->segments[AMDVM_X86_SEG_GDTR].base &&
+	    idtr_limit ==
+	    state->segments[AMDVM_X86_SEG_IDTR].limit &&
+	    amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_GUEST_IDTR + 8u) ==
+	    state->segments[AMDVM_X86_SEG_IDTR].base)
+		candidates |= AMDVM_VMCB_CLEAN_DT;
+
+	if (amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_GUEST_CR0) == state->cr[0] &&
+	    amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_GUEST_CR3) == state->cr[3] &&
+	    amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_GUEST_CR4) == state->cr[4] &&
+	    amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_GUEST_EFER) ==
+	    (state->efer | AMDVM_EFER_SVME))
+		candidates |= AMDVM_VMCB_CLEAN_CR;
+	if (amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_GUEST_DR6) == state->dr[6] &&
+	    amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_GUEST_DR7) == state->dr[7])
+		candidates |= AMDVM_VMCB_CLEAN_DR;
+	if (amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_GUEST_CR2) == state->cr[2])
+		candidates |= AMDVM_VMCB_CLEAN_CR2;
+	return candidates;
+}
 
 static void
 amdvm_vmcb_set_segment(amdvm_vmcb_t *vmcb, uint32_t offset,
@@ -84,6 +217,16 @@ amdvm_vmcb_get_u64(const amdvm_vmcb_t *vmcb, uint32_t offset)
 	return value;
 }
 
+void
+amdvm_vmcb_clear_clean_bits(amdvm_vmcb_t *vmcb)
+{
+	/*
+	 * Guest state is rewritten by QEMU before each RUN. Clear the whole field
+	 * so VMRUN cannot satisfy those writes from the processor's VMCB state cache.
+	 */
+	amdvm_vmcb_set_u32(vmcb, AMDVM_VMCB_CLEAN_BITS, 0);
+}
+
 int
 amdvm_vmcb_external_interrupt_exit_enabled(const amdvm_vmcb_t *vmcb)
 {
@@ -131,18 +274,40 @@ amdvm_vmcb_validate_event_injection(uint32_t event_injection,
 }
 
 int
+amdvm_vmcb_validate_event_injection_diagnostic_pf(uint32_t event_injection,
+	uint32_t error_code)
+{
+	uint32_t event_type;
+	uint32_t vector;
+
+	if (amdvm_vmcb_validate_event_injection(event_injection,
+	    error_code) == 0)
+		return 0;
+	if ((event_injection & AMDVM_VCPU_EVENTINJ_VALID) == 0 ||
+	    (event_injection & AMDVM_VCPU_EVENTINJ_RESERVED_MASK) != 0)
+		return -1;
+	event_type = event_injection & AMDVM_VCPU_EVENTINJ_TYPE_MASK;
+	vector = event_injection & 0xffu;
+	if (event_type != AMDVM_VCPU_EVENTINJ_TYPE_EXCEPTION ||
+	    vector != AMDVM_VCPU_EXCEPTION_PF ||
+	    (event_injection & AMDVM_VCPU_EVENTINJ_ERROR_VALID) == 0)
+		return -1;
+	return 0;
+}
+
+int
 amdvm_vmcb_validate_x86_state_v1(
 	const struct amdvm_x86_guest_state_v1 *state)
 {
 	size_t i;
 	if (state == NULL ||
-	    state->abi_version != AMDVM_X86_STATE_ABI_VERSION ||
+	    !amdvm_x86_state_abi_supported(state->abi_version) ||
 	    (state->interruptibility & ~(AMDVM_X86_INTERRUPTIBILITY_STI_SHADOW |
 	    AMDVM_X86_INTERRUPTIBILITY_NMI_BLOCKED |
 	    AMDVM_X86_INTERRUPTIBILITY_NMI_IRET_STEP)) != 0 ||
 	    ((state->interruptibility & AMDVM_X86_INTERRUPTIBILITY_NMI_IRET_STEP) &&
 	    !(state->interruptibility & AMDVM_X86_INTERRUPTIBILITY_NMI_BLOCKED)) ||
-	    state->cr[1] != 0 ||
+	    !amdvm_vmcb_state_cr8_valid(state) ||
 	    (state->rflags & 2u) == 0 ||
 	    (state->rflags & AMDVM_RFLAGS_RESERVED_MASK) != 0 ||
 	    ((state->cr[0] & AMDVM_CR0_NW) != 0 &&
@@ -172,14 +337,14 @@ amdvm_vmcb_validate_x86_state_v1(
 	return 0;
 }
 
-int
-amdvm_vmcb_load_x86_state_v1(amdvm_vmcb_t *vmcb,
+static int
+amdvm_vmcb_load_x86_state_v1_impl(amdvm_vmcb_t *vmcb,
 	const struct amdvm_x86_guest_state_v1 *state, uint64_t gprs[15],
-	void *guest_xstate, size_t guest_xstate_size)
+	void *guest_xstate, size_t guest_xstate_size, int already_validated)
 {
 	size_t i;
-	if (vmcb == NULL || gprs == NULL || guest_xstate == NULL ||
-	    amdvm_vmcb_validate_x86_state_v1(state) != 0) {
+	if (vmcb == NULL || state == NULL || gprs == NULL || guest_xstate == NULL ||
+	    (!already_validated && amdvm_vmcb_validate_x86_state_v1(state) != 0)) {
 		return -1;
 	}
 	/* Copy and validate XSTATE before mutating the VMCB or GPR frame. */
@@ -248,7 +413,33 @@ amdvm_vmcb_load_x86_state_v1(amdvm_vmcb_t *vmcb,
 	for (i = 8; i < AMDVM_X86_GPR_COUNT; ++i) {
 		gprs[i - 1u] = state->gpr[i];
 	}
+	if (amdvm_vmcb_cr8_intercepts(vmcb,
+	    state->abi_version != AMDVM_X86_STATE_ABI_VERSION_V3) != 0) {
+		return -1;
+	}
+	if (state->abi_version == AMDVM_X86_STATE_ABI_VERSION_V3 &&
+	    amdvm_vmcb_apply_vtpr(vmcb, state->cr[1]) != 0) {
+		return -1;
+	}
 	return 0;
+}
+
+int
+amdvm_vmcb_load_x86_state_v1(amdvm_vmcb_t *vmcb,
+	const struct amdvm_x86_guest_state_v1 *state, uint64_t gprs[15],
+	void *guest_xstate, size_t guest_xstate_size)
+{
+	return amdvm_vmcb_load_x86_state_v1_impl(vmcb, state, gprs, guest_xstate,
+	    guest_xstate_size, 0);
+}
+
+int
+amdvm_vmcb_load_x86_state_v1_validated(amdvm_vmcb_t *vmcb,
+	const struct amdvm_x86_guest_state_v1 *state, uint64_t gprs[15],
+	void *guest_xstate, size_t guest_xstate_size)
+{
+	return amdvm_vmcb_load_x86_state_v1_impl(vmcb, state, gprs, guest_xstate,
+	    guest_xstate_size, 1);
 }
 
 int
@@ -259,7 +450,7 @@ amdvm_vmcb_arm_nmi_iret_step(amdvm_vmcb_t *vmcb,
 	uint32_t exceptions;
 	uint64_t rflags;
 	if (vmcb == NULL || state == NULL || saved_exception_intercepts == NULL ||
-	    state->abi_version != AMDVM_X86_STATE_ABI_VERSION ||
+	    !amdvm_x86_state_abi_supported(state->abi_version) ||
 	    (state->interruptibility &
 	     (AMDVM_X86_INTERRUPTIBILITY_NMI_BLOCKED |
 	      AMDVM_X86_INTERRUPTIBILITY_NMI_IRET_STEP)) !=
@@ -301,6 +492,33 @@ amdvm_vmcb_finish_nmi_iret_step(amdvm_vmcb_t *vmcb,
 }
 
 int
+amdvm_vmcb_add_exception_intercepts(amdvm_vmcb_t *vmcb, uint32_t mask,
+	uint32_t *saved_exception_intercepts)
+{
+	uint32_t exceptions;
+
+	if (vmcb == NULL || mask == 0 || saved_exception_intercepts == NULL) {
+		return -1;
+	}
+	memcpy(&exceptions, &vmcb->bytes[AMDVM_VMCB_INTERCEPT_EXCEPTIONS],
+	    sizeof(exceptions));
+	*saved_exception_intercepts = exceptions;
+	amdvm_vmcb_set_u32(vmcb, AMDVM_VMCB_INTERCEPT_EXCEPTIONS,
+	    exceptions | mask);
+	return 0;
+}
+
+void
+amdvm_vmcb_restore_exception_intercepts(amdvm_vmcb_t *vmcb,
+	uint32_t saved_exception_intercepts)
+{
+	if (vmcb != NULL) {
+		amdvm_vmcb_set_u32(vmcb, AMDVM_VMCB_INTERCEPT_EXCEPTIONS,
+		    saved_exception_intercepts);
+	}
+}
+
+int
 amdvm_vmcb_stage_run_request(amdvm_vmcb_t *vmcb, uint64_t gprs[15],
 	void *guest_xstate, const struct amdvm_vcpu_run_request *request,
 	int full_state)
@@ -313,7 +531,7 @@ amdvm_vmcb_stage_run_request(amdvm_vmcb_t *vmcb, uint64_t gprs[15],
 		return -1;
 	}
 	if (full_state) {
-		if (request->state.abi_version != AMDVM_X86_STATE_ABI_VERSION ||
+		if (!amdvm_x86_state_abi_supported(request->state.abi_version) ||
 		    amdvm_vmcb_load_x86_state_v1(vmcb, &request->state, gprs,
 		    guest_xstate, AMDVM_X86_XSTATE_MAX_SIZE) != 0) {
 			return -1;
@@ -344,6 +562,95 @@ amdvm_vmcb_stage_run_request(amdvm_vmcb_t *vmcb, uint64_t gprs[15],
 	memset(&vmcb->bytes[AMDVM_VMCB_DECODE_ASSIST_BYTES], 0xcc,
 	    AMDVM_VMCB_DECODE_ASSIST_MAX);
 	return 0;
+}
+
+int
+amdvm_vmcb_prepare_native_rdtsc(amdvm_vmcb_t *vmcb, uint64_t tsc_offset,
+	uint32_t *saved_misc1)
+{
+	uint32_t misc1, misc2;
+	if (vmcb == NULL || saved_misc1 == NULL) return -1;
+	memcpy(&misc1, &vmcb->bytes[AMDVM_VMCB_INTERCEPT_MISC1], sizeof(misc1));
+	memcpy(&misc2, &vmcb->bytes[AMDVM_VMCB_INTERCEPT_MISC2], sizeof(misc2));
+	/* RDTSCP must stay trapped: V_TSC_AUX is not available on every host. */
+	if ((misc1 & AMDVM_SVM_INTERCEPT_RDTSC) == 0 ||
+	    (misc2 & AMDVM_SVM_INTERCEPT_RDTSCP) == 0) return -1;
+	*saved_misc1 = misc1;
+	amdvm_vmcb_set_u64(vmcb, AMDVM_VMCB_TSC_OFFSET, tsc_offset);
+	amdvm_vmcb_set_u32(vmcb, AMDVM_VMCB_INTERCEPT_MISC1,
+	    misc1 & ~AMDVM_SVM_INTERCEPT_RDTSC);
+	return 0;
+}
+
+void
+amdvm_vmcb_restore_rdtsc_intercept(amdvm_vmcb_t *vmcb, uint32_t saved_misc1)
+{
+	if (vmcb != NULL) {
+		amdvm_vmcb_set_u32(vmcb, AMDVM_VMCB_INTERCEPT_MISC1, saved_misc1);
+	}
+}
+
+int
+amdvm_vmcb_prepare_native_cr2_read(amdvm_vmcb_t *vmcb,
+	uint16_t *saved_cr_read)
+{
+	uint16_t cr_read;
+	uint16_t cr2_bit = (uint16_t)(1u << AMDVM_VMCB_CR2_INDEX);
+
+	if (vmcb == NULL || saved_cr_read == NULL) return -1;
+	memcpy(&cr_read, &vmcb->bytes[AMDVM_VMCB_INTERCEPT_CR_READ],
+	    sizeof(cr_read));
+	if ((cr_read & cr2_bit) == 0) return -1;
+	*saved_cr_read = cr_read;
+	amdvm_vmcb_set_u16(vmcb, AMDVM_VMCB_INTERCEPT_CR_READ,
+	    (uint16_t)(cr_read & ~cr2_bit));
+	return 0;
+}
+
+void
+amdvm_vmcb_restore_cr2_read_intercept(amdvm_vmcb_t *vmcb,
+	uint16_t saved_cr_read)
+{
+	if (vmcb != NULL) {
+		amdvm_vmcb_set_u16(vmcb, AMDVM_VMCB_INTERCEPT_CR_READ,
+		    saved_cr_read);
+	}
+}
+
+int
+amdvm_vmcb_prepare_native_cr3(amdvm_vmcb_t *vmcb,
+	uint16_t *saved_cr_read, uint16_t *saved_cr_write)
+{
+	uint16_t cr_read, cr_write;
+	const uint16_t cr3_bit = (uint16_t)(1u << 3);
+
+	if (vmcb == NULL || saved_cr_read == NULL || saved_cr_write == NULL ||
+	    (amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_GUEST_CR4) &
+	    AMDVM_CR4_PCIDE) != 0) return -1;
+	memcpy(&cr_read, &vmcb->bytes[AMDVM_VMCB_INTERCEPT_CR_READ],
+	    sizeof(cr_read));
+	memcpy(&cr_write, &vmcb->bytes[AMDVM_VMCB_INTERCEPT_CR_WRITE],
+	    sizeof(cr_write));
+	if ((cr_read & cr3_bit) == 0 || (cr_write & cr3_bit) == 0) return -1;
+	*saved_cr_read = cr_read;
+	*saved_cr_write = cr_write;
+	amdvm_vmcb_set_u16(vmcb, AMDVM_VMCB_INTERCEPT_CR_READ,
+	    (uint16_t)(cr_read & ~cr3_bit));
+	amdvm_vmcb_set_u16(vmcb, AMDVM_VMCB_INTERCEPT_CR_WRITE,
+	    (uint16_t)(cr_write & ~cr3_bit));
+	return 0;
+}
+
+void
+amdvm_vmcb_restore_native_cr3(amdvm_vmcb_t *vmcb,
+	uint16_t saved_cr_read, uint16_t saved_cr_write)
+{
+	if (vmcb != NULL) {
+		amdvm_vmcb_set_u16(vmcb, AMDVM_VMCB_INTERCEPT_CR_READ,
+		    saved_cr_read);
+		amdvm_vmcb_set_u16(vmcb, AMDVM_VMCB_INTERCEPT_CR_WRITE,
+		    saved_cr_write);
+	}
 }
 
 int
@@ -436,7 +743,7 @@ amdvm_vmcb_store_x86_state_v1(const amdvm_vmcb_t *vmcb,
 	size_t i;
 	uint32_t nmi_interruptibility;
 	if (vmcb == NULL || state == NULL || gprs == NULL || guest_xstate == NULL ||
-	    state->abi_version != AMDVM_X86_STATE_ABI_VERSION ||
+	    !amdvm_x86_state_abi_supported(state->abi_version) ||
 	    (state->interruptibility & ~(AMDVM_X86_INTERRUPTIBILITY_STI_SHADOW |
 	    AMDVM_X86_INTERRUPTIBILITY_NMI_BLOCKED |
 	    AMDVM_X86_INTERRUPTIBILITY_NMI_IRET_STEP)) != 0 ||
@@ -484,6 +791,8 @@ amdvm_vmcb_store_x86_state_v1(const amdvm_vmcb_t *vmcb,
 		state->interruptibility |= AMDVM_X86_INTERRUPTIBILITY_STI_SHADOW;
 	}
 	state->cr[0] = amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_GUEST_CR0);
+	state->cr[1] = state->abi_version == AMDVM_X86_STATE_ABI_VERSION_V3 ?
+	    amdvm_vmcb_read_vtpr(vmcb) : 0;
 	state->cr[2] = amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_GUEST_CR2);
 	state->cr[3] = amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_GUEST_CR3);
 	state->cr[4] = amdvm_vmcb_get_u64(vmcb, AMDVM_VMCB_GUEST_CR4);

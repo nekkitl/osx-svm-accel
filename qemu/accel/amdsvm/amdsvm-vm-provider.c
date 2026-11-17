@@ -53,6 +53,68 @@ static bool valid_result(uint32_t version, uint32_t size, size_t expected)
     return version == AMDVM_VM_ABI_DRAFT_VERSION && size == expected;
 }
 
+static int provider_run_shared(AMDVMVMProvider *p, uint32_t id,
+                               const void *request, size_t request_size,
+                               amdvm_vm_abi_draft_vcpu_run_result_t *output,
+                               size_t *output_size)
+{
+    amdvm_vm_shared_run_slot_t *slot = &p->shared_run_area->slots[id];
+    amdvm_vm_shared_run_call_t call = {0};
+    amdvm_vm_shared_run_ack_t ack = {0};
+    uint64_t sequence = ++p->shared_run_sequence[id];
+    uint32_t owner;
+    size_t ack_size = sizeof(ack);
+    int transport_status;
+
+    if (sequence == 0) {
+        sequence = ++p->shared_run_sequence[id];
+    }
+    if (!amdvm_vm_shared_run_client_acquire(slot)) {
+        return -EBUSY;
+    }
+    memcpy(slot->request, request, request_size);
+    if (!amdvm_vm_shared_run_client_publish(slot, sequence,
+            (uint32_t)request_size)) {
+        (void)amdvm_vm_shared_run_client_abort_ready(slot, sequence);
+        return -EIO;
+    }
+    call.abi_version = AMDVM_VM_ABI_DRAFT_VERSION;
+    call.structure_size = sizeof(call);
+    call.vcpu_id = id;
+    call.request_size = (uint32_t)request_size;
+    call.sequence = sequence;
+    call.map_generation = p->generation;
+    transport_status = p->transport(p->opaque,
+        AMDVM_VM_ABI_DRAFT_SELECTOR_VCPU_RUN_SHARED, &call, sizeof(call),
+        &ack, &ack_size);
+
+    owner = __sync_val_compare_and_swap(&slot->owner, 0, 0);
+    if (transport_status < 0 && owner == AMDVM_VM_SHARED_RUN_READY &&
+        amdvm_vm_shared_run_client_abort_ready(slot, sequence)) {
+        return -EIO;
+    }
+    if (owner != AMDVM_VM_SHARED_RUN_COMPLETE ||
+        slot->sequence != sequence || slot->completed_sequence != sequence) {
+        /* Once provider ownership may have begun, never recycle this slot. */
+        return -EIO;
+    }
+    if ((transport_status == 0 &&
+         (ack_size != sizeof(ack) ||
+          !valid_result(ack.abi_version, ack.structure_size, ack_size) ||
+          ack.vcpu_id != id || ack.sequence != sequence ||
+          ack.map_generation != p->generation || ack.status != 0)) ||
+        slot->completion_status != 0) {
+        (void)amdvm_vm_shared_run_client_release(slot, sequence);
+        return -EIO;
+    }
+    memcpy(output, slot->result, sizeof(*output));
+    *output_size = sizeof(*output);
+    if (!amdvm_vm_shared_run_client_release(slot, sequence)) {
+        return -EIO;
+    }
+    return transport_status < 0 ? -EIO : 0;
+}
+
 int amdsvm_vm_provider_init(AMDVMVMProvider *p, AMDVMProviderTransport fn, void *opaque)
 {
     amdvm_vm_abi_draft_negotiate_request_t request = {
@@ -75,6 +137,9 @@ int amdsvm_vm_provider_init(AMDVMVMProvider *p, AMDVMProviderTransport fn, void 
         (p->caps.feature_flags & required) != required || !p->caps.max_vcpus ||
         !p->caps.max_memory_ranges || !p->caps.max_guest_bytes ||
         p->caps.max_mapped_bytes < p->caps.max_guest_bytes) { return -ENOTSUP; }
+    p->state_abi = (p->caps.feature_flags &
+                    AMDVM_VM_ABI_DRAFT_FEATURE_NATIVE_CR8_V1) ?
+        AMDVM_X86_STATE_ABI_VERSION_V3 : AMDVM_X86_STATE_ABI_VERSION_V2;
     return 0;
 }
 
@@ -155,6 +220,8 @@ int amdsvm_vm_provider_create(AMDVMVMProvider *p, uint32_t id, uint32_t apic_id)
         result.vcpu_id != id || result.map_generation != p->generation || !result.npt_page_count) {
         return -EIO;
     }
+    /* A newly-created provider context starts with no latched kick. */
+    qatomic_set(&p->kick_generation[id], 0);
     qatomic_set(&p->cpus[id], true);
     return 0;
 }
@@ -190,6 +257,7 @@ int amdsvm_vm_provider_destroy_vcpu(AMDVMVMProvider *p, uint32_t id)
         return -EIO;
     }
     qatomic_set(&p->cpus[id], false);
+    qatomic_set(&p->kick_generation[id], 0);
     operation_leave(p);
     return 0;
 }
@@ -343,8 +411,57 @@ bool amdsvm_vm_provider_supports_kick(const AMDVMVMProvider *p)
                  AMDVM_VM_ABI_DRAFT_FEATURE_VCPU_KICK_V1) != 0;
 }
 
+int amdsvm_vm_provider_report_pause_stats(AMDVMVMProvider *p)
+{
+    amdvm_vm_abi_draft_vcpu_kick_request_t request = {0};
+    amdvm_vm_abi_draft_vcpu_kick_result_t result = {0};
+    size_t size = sizeof(result);
+    uint32_t id;
+    bool reported = false;
+
+    if (!p) {
+        return -EINVAL;
+    }
+    if (operation_enter(p)) {
+        return -ESHUTDOWN;
+    }
+    if (!(p->caps.feature_flags &
+          AMDVM_VM_ABI_DRAFT_FEATURE_PROVIDER_PAUSE_STATS_V1) ||
+        !p->transport || !qatomic_read(&p->mapped)) {
+        operation_leave(p);
+        return -ENOTSUP;
+    }
+    for (id = 0; id < AMDVM_VM_ABI_DRAFT_MAX_VCPUS; id++) {
+        if (!qatomic_read(&p->cpus[id])) {
+            continue;
+        }
+        memset(&request, 0, sizeof(request));
+        memset(&result, 0, sizeof(result));
+        size = sizeof(result);
+        request.abi_version = AMDVM_VM_ABI_DRAFT_VERSION;
+        request.structure_size = sizeof(request);
+        request.vcpu_id = id;
+        request.flags = AMDVM_VM_ABI_DRAFT_VCPU_KICK_REPORT_PAUSE_STATS;
+        request.map_generation = p->generation;
+        request.kick_generation = qatomic_read(&p->kick_generation[id]);
+        if (p->transport(p->opaque, AMDVM_VM_ABI_DRAFT_SELECTOR_VCPU_KICK,
+                &request, sizeof(request), &result, &size) < 0 ||
+            size != sizeof(result) ||
+            !valid_result(result.abi_version, result.structure_size, size) ||
+            result.vcpu_id != id || result.context_status ||
+            result.map_generation != p->generation) {
+            operation_leave(p);
+            return -EIO;
+        }
+        reported = true;
+    }
+    operation_leave(p);
+    return reported ? 0 : -EAGAIN;
+}
+
 int amdsvm_vm_provider_kick(AMDVMVMProvider *p, uint32_t id,
-                            uint64_t kick_generation)
+                            uint64_t kick_generation,
+                            uint64_t *latched_generation)
 {
     amdvm_vm_abi_draft_vcpu_kick_request_t request = {0};
     amdvm_vm_abi_draft_vcpu_kick_result_t result = {0};
@@ -397,14 +514,28 @@ int amdsvm_vm_provider_kick(AMDVMVMProvider *p, uint32_t id,
         operation_leave(p);
         return -EIO;
     }
+    /* The provider may already know a newer generation after a reset/race. */
+    current = __sync_val_compare_and_swap(&p->kick_generation[id], 0, 0);
+    while (generation_newer(result.kick_generation, current)) {
+        if (__sync_bool_compare_and_swap(&p->kick_generation[id], current,
+                                         result.kick_generation)) {
+            break;
+        }
+        current = __sync_val_compare_and_swap(&p->kick_generation[id], 0, 0);
+    }
+    if (latched_generation) {
+        *latched_generation = result.kick_generation;
+    }
     operation_leave(p);
     return 0;
 }
 
-int amdsvm_vm_provider_run(AMDVMVMProvider *p, uint32_t id,
+int amdsvm_vm_provider_run_ex(AMDVMVMProvider *p, uint32_t id,
                            uint64_t kick_generation,
                            uint32_t event_injection,
                            uint32_t event_injection_error_code,
+                           bool native_rdtsc, uint64_t tsc_offset,
+                           bool native_cr3,
                            const amdvm_x86_guest_state_v1_t *state,
                            amdvm_vm_abi_draft_vcpu_run_result_t *result)
 {
@@ -413,6 +544,7 @@ int amdsvm_vm_provider_run(AMDVMVMProvider *p, uint32_t id,
     uint32_t allowed = AMDVM_VCPU_RUN_CALLED |
         AMDVM_VCPU_RUN_LEASE_RETAINED | AMDVM_VCPU_RUN_KICKED;
     size_t size = sizeof(output);
+    uint64_t current;
     int rc = 0;
     bool preentry_fpu_not_ready;
     bool run_entry_gated;
@@ -425,7 +557,7 @@ int amdsvm_vm_provider_run(AMDVMVMProvider *p, uint32_t id,
     }
     if (!run_kick_supported(p) || !p->transport || !state ||
         !result || id >= AMDVM_VM_ABI_DRAFT_MAX_VCPUS ||
-        state->abi_version != AMDVM_X86_STATE_ABI_VERSION) {
+        state->abi_version != p->state_abi) {
         operation_leave(p);
         return -EINVAL;
     }
@@ -433,12 +565,48 @@ int amdsvm_vm_provider_run(AMDVMVMProvider *p, uint32_t id,
         operation_leave(p);
         return -EAGAIN;
     }
+    /* A QEMU-side snapshot can lag a kick already latched by the provider. */
+    current = __sync_val_compare_and_swap(&p->kick_generation[id], 0, 0);
+    if (generation_newer(current, kick_generation)) {
+        kick_generation = current;
+    }
     if (((event_injection & AMDVM_VCPU_EVENTINJ_TYPE_MASK) ==
           AMDVM_VCPU_EVENTINJ_TYPE_NMI ||
          (state->interruptibility &
           (AMDVM_X86_INTERRUPTIBILITY_NMI_BLOCKED |
            AMDVM_X86_INTERRUPTIBILITY_NMI_IRET_STEP))) &&
         !(p->caps.feature_flags & AMDVM_VM_ABI_DRAFT_FEATURE_NMI_EVENT_V1)) {
+        operation_leave(p);
+        return -ENOTSUP;
+    }
+    if (native_rdtsc && !(p->caps.feature_flags &
+                          AMDVM_VM_ABI_DRAFT_FEATURE_NATIVE_RDTSC_V1)) {
+        operation_leave(p);
+        return -ENOTSUP;
+    }
+    if (native_cr3 && !(p->caps.feature_flags &
+            AMDVM_VM_ABI_DRAFT_FEATURE_NATIVE_CR3_V1)) {
+        operation_leave(p);
+        return -ENOTSUP;
+    }
+    if (native_cr3 && (state->cr[4] & (UINT64_C(1) << 17))) {
+        operation_leave(p);
+        return -ENOTSUP;
+    }
+    if ((p->mtrr_cache_enabled && !(p->caps.feature_flags &
+           AMDVM_VM_ABI_DRAFT_FEATURE_MTRR_PAT_CACHE_V1)) ||
+        (p->provider_pause_enabled && !(p->caps.feature_flags &
+           AMDVM_VM_ABI_DRAFT_FEATURE_PROVIDER_PAUSE_STATS_V1))) {
+        operation_leave(p);
+        return -ENOTSUP;
+    }
+    if (p->diagnostic_gp_intercept && !(p->caps.feature_flags &
+            AMDVM_VM_ABI_DRAFT_FEATURE_DIAGNOSTIC_GP_INTERCEPT)) {
+        operation_leave(p);
+        return -ENOTSUP;
+    }
+    if (p->diagnostic_pf_intercept && !(p->caps.feature_flags &
+            AMDVM_VM_ABI_DRAFT_FEATURE_DIAGNOSTIC_PF_INTERCEPT)) {
         operation_leave(p);
         return -ENOTSUP;
     }
@@ -453,10 +621,44 @@ int amdsvm_vm_provider_run(AMDVMVMProvider *p, uint32_t id,
     request.kick_generation = kick_generation;
     request.event_injection = event_injection;
     request.event_injection_error_code = event_injection_error_code;
+    if (native_rdtsc) {
+        request.flags |= AMDVM_VM_ABI_DRAFT_VCPU_RUN_NATIVE_RDTSC;
+        request.tsc_offset = tsc_offset;
+    }
+    if (native_cr3) {
+        request.flags |= AMDVM_VM_ABI_DRAFT_VCPU_RUN_NATIVE_CR3;
+    }
+    if (p->mtrr_cache_enabled) {
+        request.flags |= AMDVM_VM_ABI_DRAFT_VCPU_RUN_MTRR_CACHE;
+    }
+    if (p->provider_pause_enabled) {
+        request.flags |= AMDVM_VM_ABI_DRAFT_VCPU_RUN_PROVIDER_PAUSE;
+    }
+    if (p->diagnostic_gp_intercept) {
+        request.flags |=
+            AMDVM_VM_ABI_DRAFT_VCPU_RUN_DIAGNOSTIC_INTERCEPT_GP;
+    }
+    if (p->diagnostic_pf_intercept) {
+        request.flags |=
+            AMDVM_VM_ABI_DRAFT_VCPU_RUN_DIAGNOSTIC_INTERCEPT_PF;
+    }
     request.state = *state;
 
-    if (p->transport(p->opaque, AMDVM_VM_ABI_DRAFT_SELECTOR_VCPU_RUN,
-            &request, sizeof(request), &output, &size) < 0) {
+    size_t request_size = sizeof(request);
+    if (!native_rdtsc && !(p->caps.feature_flags &
+                           AMDVM_VM_ABI_DRAFT_FEATURE_NATIVE_RDTSC_V1)) {
+        /* Keep wire compatibility with providers built before native TSC. */
+        request.structure_size = AMDVM_VM_ABI_DRAFT_VCPU_RUN_REQUEST_V2_SIZE;
+        request_size = AMDVM_VM_ABI_DRAFT_VCPU_RUN_REQUEST_V2_SIZE;
+    }
+
+    if (p->shared_run_area &&
+        (p->caps.feature_flags &
+         AMDVM_VM_ABI_DRAFT_FEATURE_SHARED_VCPU_RUN_V1)) {
+        rc = provider_run_shared(p, id, &request, request_size, &output,
+                                 &size);
+    } else if (p->transport(p->opaque, AMDVM_VM_ABI_DRAFT_SELECTOR_VCPU_RUN,
+                   &request, request_size, &output, &size) < 0) {
         rc = -EIO;
     }
     preentry_fpu_not_ready = output.flags == 0 &&
@@ -479,23 +681,39 @@ int amdsvm_vm_provider_run(AMDVMVMProvider *p, uint32_t id,
          (output.exit_code != UINT64_MAX ||
           memcmp(&output.state, state, sizeof(*state)) != 0)) ||
         ((output.flags & AMDVM_VCPU_RUN_CALLED) &&
-         (output.exit_code == UINT64_MAX ||
-          output.state.abi_version != AMDVM_X86_STATE_ABI_VERSION)) ||
+         output.state.abi_version != p->state_abi) ||
         ((output.flags & AMDVM_VCPU_RUN_KICKED) &&
-         output.state.abi_version != AMDVM_X86_STATE_ABI_VERSION)) {
-        rc = -EIO;
+         output.state.abi_version != p->state_abi)) {
+        rc = rc < 0 ? rc : -EPROTO;
     } else if (run_entry_gated) {
         /* The kernel intentionally kept RUN fail-closed; no hardware entry. */
         rc = -ENOTSUP;
+    } else if ((output.flags & AMDVM_VCPU_RUN_CALLED) &&
+               output.exit_code == (UINT64_MAX - 1u)) {
+        /* VMRUN was claimed but no hardware exit was recorded. */
+        rc = -EAGAIN;
     } else if (!preentry_fpu_not_ready &&
                (output.context_status || output.owner_status || output.run_status ||
                 (output.flags & AMDVM_VCPU_RUN_LEASE_RETAINED))) {
-        rc = -EIO;
+        rc = -EPROTO;
     }
     *result = output;
     __sync_lock_release(&p->run_active[id]);
     operation_leave(p);
     return rc;
+}
+
+int amdsvm_vm_provider_run(AMDVMVMProvider *p, uint32_t id,
+                           uint64_t kick_generation,
+                           uint32_t event_injection,
+                           uint32_t event_injection_error_code,
+                           bool native_rdtsc, uint64_t tsc_offset,
+                           const amdvm_x86_guest_state_v1_t *state,
+                           amdvm_vm_abi_draft_vcpu_run_result_t *result)
+{
+    return amdsvm_vm_provider_run_ex(p, id, kick_generation, event_injection,
+        event_injection_error_code, native_rdtsc, tsc_offset, false, state,
+        result);
 }
 
 int amdsvm_vm_provider_diagnostic(AMDVMVMProvider *p, uint32_t id,

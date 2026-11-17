@@ -12,6 +12,9 @@ main(void)
 	uint32_t guest_gp = AMDVM_VCPU_EVENTINJ_VALID |
 	    AMDVM_VCPU_EVENTINJ_TYPE_EXCEPTION |
 	    AMDVM_VCPU_EVENTINJ_ERROR_VALID | AMDVM_VCPU_EXCEPTION_GP;
+	uint32_t guest_pf = AMDVM_VCPU_EVENTINJ_VALID |
+	    AMDVM_VCPU_EVENTINJ_TYPE_EXCEPTION |
+	    AMDVM_VCPU_EVENTINJ_ERROR_VALID | AMDVM_VCPU_EXCEPTION_PF;
 	uint32_t guest_nmi = AMDVM_VCPU_EVENTINJ_VALID |
 	    AMDVM_VCPU_EVENTINJ_TYPE_NMI | 2u;
 	uint64_t encoded;
@@ -20,6 +23,13 @@ main(void)
 	assert(amdvm_vmcb_validate_event_injection(0, 1) != 0);
 	assert(amdvm_vmcb_validate_event_injection(external_irq, 0) == 0);
 	assert(amdvm_vmcb_validate_event_injection(guest_gp, 0) == 0);
+	assert(amdvm_vmcb_validate_event_injection(guest_pf, 2) != 0);
+	assert(amdvm_vmcb_validate_event_injection_diagnostic_pf(
+	    guest_pf, 2) == 0);
+	assert(amdvm_vmcb_validate_event_injection_diagnostic_pf(
+	    guest_pf & ~AMDVM_VCPU_EVENTINJ_ERROR_VALID, 2) != 0);
+	assert(amdvm_vmcb_validate_event_injection_diagnostic_pf(
+	    external_irq, 0) == 0);
 
 	assert(amdvm_vmcb_validate_event_injection(external_irq, 1) != 0);
 	assert(amdvm_vmcb_validate_event_injection(

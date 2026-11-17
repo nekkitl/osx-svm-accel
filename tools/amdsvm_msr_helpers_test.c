@@ -78,7 +78,7 @@ static void test_mtrr_value_validation(void)
 	assert(amdsvm_mtrr_mask_value_valid(AMDVM_MTRR_MASK_VALID, 36));
 	assert(amdsvm_mtrr_base_matches_mask(AMDVM_MTRR_TYPE_WB,
 	                                     AMDVM_MTRR_MASK_VALID, 36));
-	/* Reference TCG trace: 2 GiB PCI hole starting at the 2 GiB boundary. */
+	/* Alpine TCG trace: 2 GiB PCI hole starting at the 2 GiB boundary. */
 	assert(amdsvm_mtrr_base_value_valid(UINT64_C(0x80000000), 40));
 	assert(amdsvm_mtrr_mask_value_valid(UINT64_C(0xff80000800), 40));
 	assert(amdsvm_mtrr_base_matches_mask(UINT64_C(0x80000000),

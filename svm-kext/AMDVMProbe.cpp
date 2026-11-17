@@ -2,6 +2,7 @@
 #include <IOKit/IOLocks.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOUserClient.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <kern/clock.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
@@ -18,6 +19,11 @@
 #include "provider/amdvm_vmcb.h"
 #include "provider/amdvm_npt.h"
 #include "provider/amdvm_xstate.h"
+#include "provider/amdvm_xstate_capture_policy.h"
+#include "provider/amdvm_pause_fastpath.h"
+#include "provider/amdvm_run_buffer.h"
+#include "provider/amdvm_run_slot_lifetime.h"
+#include "amdvm_vm_shared_run.h"
 
 extern "C" int cpu_number(void);
 
@@ -28,6 +34,116 @@ static volatile uint32_t gVcpuFpuRejectLogged = 0;
 static volatile uint32_t gVcpuContextCount = 0;
 static volatile uint32_t gVcpuLeaseCount = 0;
 static volatile uint32_t gVcpuRunNotReadyLogCount = 0;
+static volatile uint32_t gInvalidVmcbFailureReported = 0;
+
+static void
+amdvm_pause_stats_report(uint32_t vcpu_id, uint64_t kick_generation,
+	uint64_t entries, uint64_t handled, uint64_t budget, uint64_t events,
+	uint64_t unhandled)
+{
+	IOLog("AMDVM_PAUSE_STATS vcpu=%u kick_generation=%llu fast_path_entries=%llu pause_handled=%llu returns_budget=%llu returns_event=%llu returns_unhandled=%llu\n",
+	    vcpu_id, (unsigned long long)kick_generation,
+	    (unsigned long long)entries, (unsigned long long)handled,
+	    (unsigned long long)budget, (unsigned long long)events,
+	    (unsigned long long)unhandled);
+}
+
+#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+static void
+amdvm_provider_timing_report(uint32_t vcpu_id, uint64_t runs,
+	uint64_t state_set_ticks, uint64_t xstate_preflight_ticks,
+	uint64_t interrupt_off_ticks, uint64_t run_ticks, uint64_t state_get_ticks,
+	uint64_t memory_type_ticks, uint64_t owner_acquire_ticks,
+	uint64_t vmcb_prepare_ticks, uint64_t vmrun_xstate_ticks,
+	uint64_t owner_release_ticks, uint64_t vmrun_samples)
+{
+	uint64_t state_set_ns = 0, xstate_preflight_ns = 0;
+	uint64_t interrupt_off_ns = 0, run_ns = 0, state_get_ns = 0;
+	uint64_t memory_type_ns = 0, owner_acquire_ns = 0;
+	uint64_t vmcb_prepare_ns = 0, vmrun_xstate_ns = 0, owner_release_ns = 0;
+	absolutetime_to_nanoseconds(state_set_ticks, &state_set_ns);
+	absolutetime_to_nanoseconds(xstate_preflight_ticks, &xstate_preflight_ns);
+	absolutetime_to_nanoseconds(interrupt_off_ticks, &interrupt_off_ns);
+	absolutetime_to_nanoseconds(run_ticks, &run_ns);
+	absolutetime_to_nanoseconds(state_get_ticks, &state_get_ns);
+	absolutetime_to_nanoseconds(memory_type_ticks, &memory_type_ns);
+	absolutetime_to_nanoseconds(owner_acquire_ticks, &owner_acquire_ns);
+	absolutetime_to_nanoseconds(vmcb_prepare_ticks, &vmcb_prepare_ns);
+	absolutetime_to_nanoseconds(vmrun_xstate_ticks, &vmrun_xstate_ns);
+	absolutetime_to_nanoseconds(owner_release_ticks, &owner_release_ns);
+	IOLog("AMDVM_PROVIDER_TIMING vcpu=%u runs=%llu vmrun_samples=%llu state_set_ns=%llu xstate_preflight_ns=%llu interrupt_off_ns=%llu context_run_ns=%llu state_get_ns=%llu memory_type_check_ns=%llu owner_acquire_ns=%llu vmcb_prepare_ns=%llu vmrun_xstate_ns=%llu owner_release_ns=%llu\n",
+	    vcpu_id, (unsigned long long)runs,
+	    (unsigned long long)vmrun_samples,
+	    (unsigned long long)state_set_ns,
+	    (unsigned long long)xstate_preflight_ns,
+	    (unsigned long long)interrupt_off_ns,
+	    (unsigned long long)run_ns,
+	    (unsigned long long)state_get_ns,
+	    (unsigned long long)memory_type_ns,
+	    (unsigned long long)owner_acquire_ns,
+	    (unsigned long long)vmcb_prepare_ns,
+	    (unsigned long long)vmrun_xstate_ns,
+	    (unsigned long long)owner_release_ns);
+}
+#endif
+
+static int
+amdvm_vmapi_run_context(amdvm_hlt_context_t *context, int *owner_status,
+	amdvm_vmrun_status_t *vmrun_status,
+	amdvm_vmexit_snapshot_t *exit_snapshot, bool nativeCr3)
+{
+#if defined(AMDVM_EXPERIMENTAL_NATIVE_CR3)
+	if (nativeCr3) {
+		uint16_t savedCrRead = 0, savedCrWrite = 0;
+		int status;
+		if (amdvm_vmcb_prepare_native_cr3(context->guest_vmcb,
+		    &savedCrRead, &savedCrWrite) != 0) {
+			*owner_status = AMDVM_SVM_OWNER_INVALID;
+			*vmrun_status = AMDVM_VMRUN_INVALID_ARGUMENT;
+			return AMDVM_HLT_CONTEXT_INVALID_GUEST;
+		}
+		status = amdvm_hlt_context_run(context, owner_status, vmrun_status,
+		    exit_snapshot);
+		amdvm_vmcb_restore_native_cr3(context->guest_vmcb,
+		    savedCrRead, savedCrWrite);
+		return status;
+	}
+#else
+	if (nativeCr3) {
+		*owner_status = AMDVM_SVM_OWNER_INVALID;
+		*vmrun_status = AMDVM_VMRUN_INVALID_ARGUMENT;
+		return AMDVM_HLT_CONTEXT_INVALID_GUEST;
+	}
+#endif
+#if defined(AMDVM_EXPERIMENTAL_NATIVE_CR2_READ)
+	uint16_t savedCrRead = 0;
+	int status;
+
+	if (amdvm_vmcb_prepare_native_cr2_read(context->guest_vmcb,
+	    &savedCrRead) != 0) {
+		*owner_status = AMDVM_SVM_OWNER_INVALID;
+		*vmrun_status = AMDVM_VMRUN_INVALID_ARGUMENT;
+		return AMDVM_HLT_CONTEXT_INVALID_GUEST;
+	}
+	status = amdvm_hlt_context_run(context, owner_status, vmrun_status,
+	    exit_snapshot);
+	amdvm_vmcb_restore_cr2_read_intercept(context->guest_vmcb, savedCrRead);
+	return status;
+#else
+	return amdvm_hlt_context_run(context, owner_status, vmrun_status,
+	    exit_snapshot);
+#endif
+}
+
+static bool
+amdvm_provider_pause_cycle_enabled(void)
+{
+#if defined(AMDVM_EXPERIMENTAL_PROVIDER_PAUSE)
+	return true;
+#else
+	return false;
+#endif
+}
 
 class AMDVMObjectRetainGuard {
 public:
@@ -44,11 +160,10 @@ private:
 };
 
 /*
- * XNU may set CR0.TS while the caller is preempted between an XSAVE and
- * acquiring the CPU-pinning lock. Do not treat that race as a permanent FPU
- * failure, and never issue XSAVE with interrupts disabled until TS is known
- * clear while the current thread is pinned. A retry with interrupts enabled
- * lets XNU's ordinary #NM path restore this thread's PCB state.
+ * On the steady CR0.TS=0 path, acquire runLock first and perform one XSAVE
+ * after pinning the thread. If TS is set (including a race detected after
+ * locking), release the lock and use an XSAVE with interrupts enabled so XNU's
+ * ordinary #NM path can restore the PCB state. Never clear TS directly.
  *
  * Success returns with runLock held and local interrupts disabled, ready for
  * the caller's bounded operation. Failure always returns with both restored.
@@ -57,36 +172,44 @@ static int
 amdvm_capture_xstate_pinned(void *area, uint64_t *xcr0,
 	thread_t expectedThread, IOSimpleLock *runLock,
 	int *cpuBefore, int *cpuAfter, uint64_t *cr0Before, uint64_t *cr0After,
-	IOInterruptState *interruptState, int *firstStatus, int *secondStatus)
+	IOInterruptState *interruptState, int *firstStatus, int *secondStatus,
+	uint64_t *interruptOffStartTicks)
 {
 	const unsigned int retryLimit = 4;
 	int status = AMDVM_VMRUN_FPU_NOT_READY;
 
 	for (unsigned int attempt = 0; attempt < retryLimit; ++attempt) {
-		uint64_t pinnedCr0;
-		uint64_t firstXcr0 = 0;
-		uint64_t firstCr0Before = 0;
-		uint64_t firstCr0After = 0;
-
-		status = amdvm_vmrun_xstate_capture_current_thread(area, &firstXcr0,
-		    &firstCr0Before, &firstCr0After);
-		if (status != AMDVM_VMRUN_SUCCESS) {
-			/* Retry only the observed lazy-FPU transition; other failures stay hard. */
+		uint64_t observedCr0;
+		__asm__ volatile("mov %%cr0, %0" : "=r"(observedCr0));
+		*cr0Before = observedCr0;
+		*cr0After = observedCr0;
+		amdvm_xstate_capture_action_t preflightAction =
+		    amdvm_xstate_capture_preflight_action(observedCr0);
+		if (preflightAction == AMDVM_XSTATE_CAPTURE_REJECT) {
+			status = AMDVM_VMRUN_FPU_NOT_READY;
+			*firstStatus = status;
+			*secondStatus = AMDVM_VMRUN_INVALID_ARGUMENT;
+			return status;
+		}
+		if (preflightAction == AMDVM_XSTATE_CAPTURE_LAZY_RESTORE) {
+			uint64_t lazyXcr0 = 0;
+			status = amdvm_vmrun_xstate_capture_current_thread(area, &lazyXcr0,
+			    cr0Before, cr0After);
+			if (status == AMDVM_VMRUN_SUCCESS) {
+				*xcr0 = lazyXcr0;
+				*firstStatus = AMDVM_VMRUN_SUCCESS;
+				continue;
+			}
 			if (status == AMDVM_VMRUN_FPU_NOT_READY &&
-			    (firstCr0After & (UINT64_C(1) << 3)) != 0 &&
-			    (firstCr0After & (UINT64_C(1) << 2)) == 0) {
-				*xcr0 = firstXcr0;
-				*cr0Before = firstCr0Before;
-				*cr0After = firstCr0After;
+			    (*cr0After & AMDVM_XSTATE_POLICY_CR0_TS) != 0 &&
+			    (*cr0After & AMDVM_XSTATE_POLICY_CR0_EM) == 0) {
+				*xcr0 = lazyXcr0;
 				continue;
 			}
 			*firstStatus = status;
 			*secondStatus = AMDVM_VMRUN_INVALID_ARGUMENT;
 			return status;
 		}
-		*xcr0 = firstXcr0;
-		*cr0Before = firstCr0Before;
-		*cr0After = firstCr0After;
 
 		IOSimpleLockLock(runLock);
 		if (expectedThread != current_thread()) {
@@ -95,24 +218,27 @@ amdvm_capture_xstate_pinned(void *area, uint64_t *xcr0,
 			break;
 		}
 		*cpuBefore = cpu_number();
+		uint64_t pinnedCr0;
 		__asm__ volatile("mov %%cr0, %0" : "=r"(pinnedCr0));
-		if ((pinnedCr0 & (UINT64_C(1) << 2)) != 0) {
-			*cr0Before = pinnedCr0;
-			*cr0After = pinnedCr0;
+		*cr0Before = pinnedCr0;
+		*cr0After = pinnedCr0;
+		amdvm_xstate_capture_action_t pinnedAction =
+		    amdvm_xstate_capture_pinned_action(pinnedCr0,
+		    expectedThread == current_thread());
+		if (pinnedAction == AMDVM_XSTATE_CAPTURE_REJECT ||
+		    pinnedAction == AMDVM_XSTATE_CAPTURE_RETRY) {
 			IOSimpleLockUnlock(runLock);
 			status = AMDVM_VMRUN_FPU_NOT_READY;
 			break;
 		}
-		if ((pinnedCr0 & (UINT64_C(1) << 3)) != 0) {
-			/* A context switch set TS before the lock pinned this thread. */
-			*cr0Before = pinnedCr0;
-			*cr0After = pinnedCr0;
+		if (pinnedAction == AMDVM_XSTATE_CAPTURE_LAZY_RESTORE) {
 			IOSimpleLockUnlock(runLock);
-			status = AMDVM_VMRUN_FPU_NOT_READY;
 			continue;
 		}
 
 		*interruptState = ml_set_interrupts_enabled(FALSE);
+		if (interruptOffStartTicks != nullptr)
+			*interruptOffStartTicks = mach_absolute_time();
 		if (expectedThread != current_thread() ||
 		    *cpuBefore != cpu_number()) {
 			(void)ml_set_interrupts_enabled(*interruptState);
@@ -120,6 +246,7 @@ amdvm_capture_xstate_pinned(void *area, uint64_t *xcr0,
 			status = AMDVM_VMRUN_FPU_NOT_READY;
 			break;
 		}
+		*firstStatus = AMDVM_VMRUN_SUCCESS;
 		status = amdvm_vmrun_xstate_capture_current_thread(area, xcr0,
 		    cr0Before, cr0After);
 		*cpuAfter = cpu_number();
@@ -140,6 +267,104 @@ amdvm_capture_xstate_pinned(void *area, uint64_t *xcr0,
 		}
 		*firstStatus = AMDVM_VMRUN_SUCCESS;
 		return status;
+	}
+
+	*firstStatus = status;
+	*secondStatus = AMDVM_VMRUN_INVALID_ARGUMENT;
+	return status;
+}
+
+/* VM-scoped RUN has a second, mandatory XSAVE at the last C boundary in
+ * amdvm_vmrun_once(). On the ordinary TS=0 path, only pin the caller here and
+ * leave the host-state save to that last-boundary capture. XSAVE here is
+ * needed only to trigger XNU's lazy #NM restore if TS is observed set. */
+static int
+amdvm_pin_run_context(void *lazyRestoreArea, thread_t expectedThread,
+	IOSimpleLock *runLock, int *cpuBefore, int *cpuAfter,
+	uint64_t *cr0Before, uint64_t *cr0After,
+	IOInterruptState *interruptState, int *firstStatus, int *secondStatus,
+	uint64_t *interruptOffStartTicks)
+{
+	const unsigned int retryLimit = 4;
+	int status = AMDVM_VMRUN_FPU_NOT_READY;
+
+	for (unsigned int attempt = 0; attempt < retryLimit; ++attempt) {
+		uint64_t observedCr0;
+		__asm__ volatile("mov %%cr0, %0" : "=r"(observedCr0));
+		*cr0Before = observedCr0;
+		*cr0After = observedCr0;
+		amdvm_xstate_capture_action_t action =
+		    amdvm_xstate_capture_preflight_action(observedCr0);
+		if (action == AMDVM_XSTATE_CAPTURE_REJECT) {
+			status = AMDVM_VMRUN_FPU_NOT_READY;
+			*firstStatus = status;
+			*secondStatus = AMDVM_VMRUN_INVALID_ARGUMENT;
+			return status;
+		}
+		if (action == AMDVM_XSTATE_CAPTURE_LAZY_RESTORE) {
+			uint64_t lazyXcr0 = 0;
+			status = amdvm_vmrun_xstate_capture_current_thread(lazyRestoreArea,
+			    &lazyXcr0, cr0Before, cr0After);
+			if (status == AMDVM_VMRUN_SUCCESS) {
+				*firstStatus = AMDVM_VMRUN_SUCCESS;
+				continue;
+			}
+			if (status == AMDVM_VMRUN_FPU_NOT_READY &&
+			    (*cr0After & AMDVM_XSTATE_POLICY_CR0_TS) != 0 &&
+			    (*cr0After & AMDVM_XSTATE_POLICY_CR0_EM) == 0) {
+				continue;
+			}
+			*firstStatus = status;
+			*secondStatus = AMDVM_VMRUN_INVALID_ARGUMENT;
+			return status;
+		}
+
+		IOSimpleLockLock(runLock);
+		if (expectedThread != current_thread()) {
+			IOSimpleLockUnlock(runLock);
+			status = AMDVM_VMRUN_FPU_NOT_READY;
+			break;
+		}
+		*cpuBefore = cpu_number();
+		uint64_t pinnedCr0;
+		__asm__ volatile("mov %%cr0, %0" : "=r"(pinnedCr0));
+		*cr0Before = pinnedCr0;
+		*cr0After = pinnedCr0;
+		action = amdvm_xstate_capture_pinned_action(pinnedCr0,
+		    expectedThread == current_thread());
+		if (action == AMDVM_XSTATE_CAPTURE_REJECT ||
+		    action == AMDVM_XSTATE_CAPTURE_RETRY) {
+			IOSimpleLockUnlock(runLock);
+			status = AMDVM_VMRUN_FPU_NOT_READY;
+			break;
+		}
+		if (action == AMDVM_XSTATE_CAPTURE_LAZY_RESTORE) {
+			IOSimpleLockUnlock(runLock);
+			continue;
+		}
+
+		*interruptState = ml_set_interrupts_enabled(FALSE);
+		if (interruptOffStartTicks != nullptr)
+			*interruptOffStartTicks = mach_absolute_time();
+		uint64_t finalCr0;
+		__asm__ volatile("mov %%cr0, %0" : "=r"(finalCr0));
+		*cr0After = finalCr0;
+		if (expectedThread != current_thread() ||
+		    *cpuBefore != cpu_number() ||
+		    amdvm_xstate_capture_pinned_action(finalCr0, 1) !=
+		    AMDVM_XSTATE_CAPTURE_PINNED) {
+			(void)ml_set_interrupts_enabled(*interruptState);
+			IOSimpleLockUnlock(runLock);
+			status = AMDVM_VMRUN_FPU_NOT_READY;
+			if ((finalCr0 & AMDVM_XSTATE_POLICY_CR0_TS) != 0 &&
+			    (finalCr0 & AMDVM_XSTATE_POLICY_CR0_EM) == 0)
+				continue;
+			break;
+		}
+		*cpuAfter = cpu_number();
+		*firstStatus = AMDVM_VMRUN_SUCCESS;
+		*secondStatus = AMDVM_VMRUN_SUCCESS;
+		return AMDVM_VMRUN_SUCCESS; /* lock held; interrupts disabled */
 	}
 
 	*firstStatus = status;
@@ -191,6 +416,18 @@ public:
 		fBytes = arguments->structureInput;
 		return true;
 	}
+	bool initEither(IOExternalMethodArguments *arguments, size_t firstSize,
+	    size_t secondSize, size_t *actualSize)
+	{
+		if (arguments == nullptr || actualSize == nullptr) return false;
+		size_t providedSize = arguments->structureInputDescriptor != nullptr ?
+		    (size_t)arguments->structureInputDescriptor->getLength() :
+		    (size_t)arguments->structureInputSize;
+		if (providedSize != firstSize && providedSize != secondSize) return false;
+		if (!init(arguments, providedSize)) return false;
+		*actualSize = providedSize;
+		return true;
+	}
 	const void *bytes() const { return fBytes; }
 private:
 	const void *fBytes;
@@ -198,20 +435,86 @@ private:
 	size_t fSize;
 };
 
+static void amdvm_run_slot_wake_if_quiescent(IOLock *lock,
+	volatile uint64_t *state, volatile uint32_t *buffer_busy);
+
+class AMDVMRunBufferGuard {
+public:
+	AMDVMRunBufferGuard() : fBusy(nullptr), fRunState(nullptr), fLock(nullptr),
+	    fActiveReference(false) {}
+	~AMDVMRunBufferGuard()
+	{
+		if (fBusy != nullptr) {
+			if (fActiveReference) (void)amdvm_run_slot_release(fRunState);
+			amdvm_run_buffer_release(fBusy);
+			amdvm_run_slot_wake_if_quiescent(fLock, fRunState, fBusy);
+		}
+	}
+	void acquire(IOLock *lock, volatile uint64_t *runState,
+	    volatile uint32_t *busy, bool activeReference)
+	{
+		fLock = lock;
+		fRunState = runState;
+		fBusy = busy;
+		fActiveReference = activeReference;
+	}
+private:
+	volatile uint32_t *fBusy;
+	volatile uint64_t *fRunState;
+	IOLock *fLock;
+	bool fActiveReference;
+};
+
+static void
+amdvm_run_slot_wake_if_quiescent(IOLock *lock, volatile uint64_t *state,
+	volatile uint32_t *buffer_busy)
+{
+	if (lock == nullptr || state == nullptr || buffer_busy == nullptr ||
+	    !amdvm_run_slot_is_closing(state)) return;
+	IOLockLock(lock);
+	if (amdvm_run_slot_quiescent(state, buffer_busy))
+		IOLockWakeup(lock, (void *)state, false);
+	IOLockUnlock(lock);
+}
+
+static bool
+amdvm_run_slot_wait_quiescent(IOLock *lock, volatile uint64_t *state,
+	volatile uint32_t *buffer_busy)
+{
+	AbsoluteTime deadline;
+	clock_interval_to_deadline(1000, 1000000u, &deadline);
+	while (!amdvm_run_slot_quiescent(state, buffer_busy)) {
+		int waitResult = IOLockSleepDeadline(lock, (void *)state,
+		    deadline, THREAD_UNINT);
+		if (waitResult == THREAD_TIMED_OUT) return false;
+	}
+	return true;
+}
+
 /* Copy large output structures through the prepared OOL descriptor supplied
  * by IOUserClient. Small results continue to use the inline structure buffer. */
 class AMDVMStructureOutput {
 public:
-	AMDVMStructureOutput() : fBytes(nullptr), fSize(0) {}
+	AMDVMStructureOutput() : fBytes(nullptr), fSize(0), fOwned(false) {}
 	~AMDVMStructureOutput()
 	{
-		if (fBytes != nullptr) IOFree(fBytes, fSize);
+		if (fOwned && fBytes != nullptr) IOFree(fBytes, fSize);
 	}
 	bool init(size_t size)
 	{
 		fBytes = IOMalloc(size);
 		if (fBytes == nullptr) return false;
 		fSize = size;
+		fOwned = true;
+		bzero(fBytes, size);
+		return true;
+	}
+	bool initWithBuffer(void *buffer, size_t size)
+	{
+		if (buffer == nullptr || size == 0) return false;
+		fBytes = buffer;
+		fSize = size;
+		fOwned = false;
 		bzero(fBytes, size);
 		return true;
 	}
@@ -234,6 +537,10 @@ public:
 		}
 		if (arguments->structureOutput == nullptr ||
 		    arguments->structureOutputSize < fSize) return kIOReturnBadArgument;
+		if (arguments->structureOutput == fBytes) {
+			arguments->structureOutputSize = (uint32_t)fSize;
+			return kIOReturnSuccess;
+		}
 		bcopy(fBytes, arguments->structureOutput, fSize);
 		arguments->structureOutputSize = (uint32_t)fSize;
 		return kIOReturnSuccess;
@@ -241,6 +548,7 @@ public:
 private:
 	void *fBytes;
 	size_t fSize;
+	bool fOwned;
 };
 
 /* Kernel collections still require kmod_info for an IOKit service kext.
@@ -412,6 +720,9 @@ public:
 	IOReturn vmVcpuCreate(IOExternalMethodArguments *arguments);
 	IOReturn vmVcpuDestroy(IOExternalMethodArguments *arguments);
 	IOReturn vmVcpuRun(IOExternalMethodArguments *arguments);
+	IOReturn vmVcpuRunInternal(IOExternalMethodArguments *arguments,
+	    int32_t expectedVcpuId, bool borrowSharedInput = false);
+	IOReturn vmVcpuRunShared(IOExternalMethodArguments *arguments);
 	IOReturn vmVcpuKick(IOExternalMethodArguments *arguments);
 	IOReturn vmVcpuState(IOExternalMethodArguments *arguments, bool set);
 	IOReturn vmVcpuDiagnostic(IOExternalMethodArguments *arguments);
@@ -422,27 +733,68 @@ public:
 	    OSObject *target = nullptr,
 	    void *reference = nullptr) APPLE_KEXT_OVERRIDE;
 	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
+	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options,
+	    IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
 	void free(void) APPLE_KEXT_OVERRIDE;
 
 private:
 	int closeVmMemory(bool orphan);
 	int closeVmCpusLocked(void);
-	struct VmCpuSlot {
+	int ensureVmSharedContextLocked(void);
+	int destroyVmSharedContextLocked(void);
+	struct __attribute__((aligned(64))) VmCpuSlot {
 		amdvm_hlt_context_t *context;
 		amdvm_vm_cpu_state_t *state;
+		void *runInput;
+		void *runOutput;
+		IOSimpleLock *runLock;
 		uint32_t apicId;
 		uint32_t resetProfile;
-		volatile uint32_t activeRuns;
-		volatile uint32_t runCpu;
-		volatile uint64_t runGeneration;
-		volatile uint64_t kickGeneration;
+		/* Diagnostic-only: keep #PF capture logging bounded to the first fault. */
+		uint32_t diagnosticPfLogged;
+		struct __attribute__((aligned(64))) HotRunState {
+			volatile uint64_t runState;
+			volatile uint32_t runBufferBusy;
+			volatile uint32_t runCpu;
+			volatile uint64_t runGeneration;
+			volatile uint64_t kickGeneration;
+		} hot;
+		struct __attribute__((aligned(64))) PauseCounters {
+			volatile uint64_t fastPathEntries;
+			volatile uint64_t handled;
+			volatile uint64_t returnsBudget;
+			volatile uint64_t returnsEvent;
+			volatile uint64_t returnsUnhandled;
+		} pause;
+		struct __attribute__((aligned(64))) ProviderTiming {
+			volatile uint64_t runs;
+			volatile uint64_t stateSetTicks;
+			volatile uint64_t xstatePreflightTicks;
+			volatile uint64_t interruptOffTicks;
+			volatile uint64_t vmrunTicks;
+			volatile uint64_t stateGetTicks;
+			volatile uint64_t memoryTypeCheckTicks;
+			volatile uint64_t ownerAcquireTicks;
+			volatile uint64_t vmcbPrepareTicks;
+			volatile uint64_t vmrunXstateTicks;
+			volatile uint64_t ownerReleaseTicks;
+			volatile uint64_t vmrunSamples;
+		} timing;
 		uint32_t leaseTracked;
-		bool closing;
 	} fVmCpus[AMDVM_VM_ABI_DRAFT_MAX_VCPUS];
+	static_assert(alignof(VmCpuSlot) >= 64 && sizeof(VmCpuSlot) % 64 == 0,
+	    "each VM vCPU slot must occupy whole cache lines");
+	static_assert(offsetof(VmCpuSlot, hot) % 64 == 0 &&
+	    offsetof(VmCpuSlot, pause) % 64 == 0 &&
+	    offsetof(VmCpuSlot, timing) % 64 == 0,
+	    "RUN coordination and telemetry must not share cache lines");
 	uint8_t *fVmResetRom;
 	IOLock *fVmLock;
 	amdvm_vm_memory_t *fVmMemory;
 	amdvm_vm_memory_t *fVmPending;
+	amdvm_hlt_context_t *fVmSharedContext;
+	IOBufferMemoryDescriptor *fVmRunSharedMemory;
+	amdvm_vm_shared_run_area_t *fVmRunSharedArea;
 	uint64_t fVmGeneration;
 	bool fVmClosed;
 	void *fSecurityID;
@@ -752,7 +1104,7 @@ AMDVMProbeUserClient::hltFpuPreflight(IOExternalMethodArguments *arguments)
 				    gHltContext.host_xstate, &result.xcr0, initialThread,
 				    runLock, &initialCpu, &finalCpu, &firstCr0Before,
 				    &firstCr0After, &interruptState, &stableFirstStatus,
-				    &stableSecondStatus);
+				    &stableSecondStatus, nullptr);
 				firstStatus = stableFirstStatus;
 				secondStatus = stableSecondStatus;
 				result.ts_before = (uint32_t)((firstCr0Before >> 3) & 1u);
@@ -1408,7 +1760,7 @@ AMDVMProbeUserClient::vcpuRun(IOExternalMethodArguments *arguments)
 	    request->event_injection_error_code) != 0) {
 		return kIOReturnNotPermitted;
 	}
-	fullState = request->state.abi_version == AMDVM_X86_STATE_ABI_VERSION;
+	fullState = amdvm_x86_state_abi_supported(request->state.abi_version);
 	if (fullState) {
 		if (request->rip != 0 || request->rflags != 0 ||
 		    amdvm_vmcb_validate_x86_state_v1(&request->state) != 0) {
@@ -1526,7 +1878,7 @@ AMDVMProbeUserClient::vcpuRun(IOExternalMethodArguments *arguments)
 				    fVcpuContext.host_xstate, &xcr0, initialThread, runLock,
 				    &cpuBefore, &cpuAfter, &cr0Before, &cr0After,
 				    &interruptState, &firstCaptureStatus,
-				    &secondCaptureStatus);
+				    &secondCaptureStatus, nullptr);
 				if (xstateStatus == AMDVM_VMRUN_SUCCESS) {
 					xstateStage = 2;
 					interruptsAfterLock = TRUE;
@@ -1915,6 +2267,9 @@ AMDVMProbeUserClient::initWithTask(task_t owningTask, void *securityID,
 	fVmLock = nullptr;
 	fVmMemory = nullptr;
 	fVmPending = nullptr;
+	fVmSharedContext = nullptr;
+	fVmRunSharedMemory = nullptr;
+	fVmRunSharedArea = nullptr;
 	fVmGeneration = 0;
 	fVmClosed = false;
 	bzero(fVmCpus, sizeof(fVmCpus));
@@ -1947,15 +2302,26 @@ AMDVMProbeUserClient::closeVmCpusLocked(void)
 	for (size_t i = 0; i < AMDVM_VM_ABI_DRAFT_MAX_VCPUS; ++i) {
 		auto *context = fVmCpus[i].context;
 		if (!context) continue;
-		if (__sync_val_compare_and_swap(&fVmCpus[i].activeRuns, 0u, 0u) != 0) {
-			fVmCpus[i].closing = true;
+		amdvm_run_slot_begin_destroy(&fVmCpus[i].hot.runState);
+		if (!amdvm_run_slot_wait_quiescent(fVmLock, &fVmCpus[i].hot.runState,
+		    &fVmCpus[i].hot.runBufferBusy)) {
+			/*
+			 * Do not free the remaining contexts while one vCPU still
+			 * owns a run reference. Return busy and let the caller retry
+			 * the whole teardown after the run drains.
+			 */
 			status = kIOReturnBusy;
-			continue;
+			break;
 		}
 		int rc = amdvm_hlt_context_destroy(context);
 		if (rc) { status = rc; continue; }
 		IOFree(context, sizeof(*context));
 		if (fVmCpus[i].state) IOFree(fVmCpus[i].state, sizeof(*fVmCpus[i].state));
+		if (fVmCpus[i].runInput)
+			IOFree(fVmCpus[i].runInput, AMDVM_VM_ABI_DRAFT_VCPU_RUN_REQUEST_V3_SIZE);
+		if (fVmCpus[i].runOutput)
+			IOFree(fVmCpus[i].runOutput, sizeof(amdvm_vm_abi_draft_vcpu_run_result_t));
+		if (fVmCpus[i].runLock) IOSimpleLockFree(fVmCpus[i].runLock);
 		if (fVmCpus[i].leaseTracked)
 			__sync_fetch_and_sub(&gVcpuLeaseCount, 1u);
 		fVmCpus[i] = {};
@@ -1965,12 +2331,53 @@ AMDVMProbeUserClient::closeVmCpusLocked(void)
 }
 
 int
+AMDVMProbeUserClient::destroyVmSharedContextLocked(void)
+{
+	if (!fVmSharedContext) return AMDVM_HLT_CONTEXT_OK;
+	int status = amdvm_hlt_context_destroy(fVmSharedContext);
+	if (status == AMDVM_HLT_CONTEXT_OK) {
+		IOFree(fVmSharedContext, sizeof(*fVmSharedContext));
+		fVmSharedContext = nullptr;
+	}
+	return status;
+}
+
+int
+AMDVMProbeUserClient::ensureVmSharedContextLocked(void)
+{
+	if (fVmSharedContext) return AMDVM_HLT_CONTEXT_OK;
+	if (!fVmMemory || !fVmResetRom) return AMDVM_HLT_CONTEXT_INVALID;
+	auto *context = static_cast<amdvm_hlt_context_t *>(
+	    IOMalloc(sizeof(amdvm_hlt_context_t)));
+	if (!context) return AMDVM_HLT_CONTEXT_ALLOC_FAILED;
+	bzero(context, sizeof(*context));
+	int status = amdvm_hlt_context_init_qemu_reset_vector_v1(context);
+	if (!status) {
+		bcopy(fVmResetRom, context->guest_payload,
+		    AMDVM_VCPU_RESET_ROM_SIZE);
+		size_t pages = 0;
+		status = amdvm_hlt_context_attach_vm_memory(context, fVmMemory,
+		    fVmGeneration, &pages);
+	}
+	if (status) {
+		if (context->initialized) {
+			(void)amdvm_hlt_context_destroy(context);
+		}
+		IOFree(context, sizeof(*context));
+		return status;
+	}
+	fVmSharedContext = context;
+	return AMDVM_HLT_CONTEXT_OK;
+}
+
+int
 AMDVMProbeUserClient::closeVmMemory(bool orphan)
 {
 	if (fVmLock == nullptr) return AMDVM_VM_MEMORY_OK;
 	IOLockLock(fVmLock);
 	fVmClosed = true;
 	int cpus = closeVmCpusLocked();
+	if (!cpus) cpus = destroyVmSharedContextLocked();
 	/* An admitted RUN still owns its VMCB/NPT and shared pinned RAM. */
 	if (cpus) {
 		IOLockUnlock(fVmLock);
@@ -2052,6 +2459,23 @@ AMDVMProbeUserClient::vmVcpuCreate(IOExternalMethodArguments *arguments)
 			IOLockUnlock(fVmLock); return kIOReturnBusy;
 		}
 	}
+	void *runInput = IOMalloc(AMDVM_VM_ABI_DRAFT_VCPU_RUN_REQUEST_V3_SIZE);
+	void *runOutput = IOMalloc(sizeof(amdvm_vm_abi_draft_vcpu_run_result_t));
+	IOSimpleLock *runLock = IOSimpleLockAlloc();
+	if (!runInput || !runOutput || !runLock) {
+		if (runInput) IOFree(runInput, AMDVM_VM_ABI_DRAFT_VCPU_RUN_REQUEST_V3_SIZE);
+		if (runOutput) IOFree(runOutput, sizeof(amdvm_vm_abi_draft_vcpu_run_result_t));
+		if (runLock) IOSimpleLockFree(runLock);
+		result.abi_version = AMDVM_VM_ABI_DRAFT_VERSION;
+		result.structure_size = sizeof(result);
+		result.vcpu_id = request->vcpu_id;
+		result.map_generation = fVmGeneration;
+		result.context_status = AMDVM_HLT_CONTEXT_ALLOC_FAILED;
+		IOLockUnlock(fVmLock);
+		bcopy(&result, arguments->structureOutput, sizeof(result));
+		arguments->structureOutputSize = sizeof(result);
+		return kIOReturnSuccess;
+	}
 	auto *context = static_cast<amdvm_hlt_context_t *>(IOMalloc(sizeof(amdvm_hlt_context_t)));
 	result.abi_version = AMDVM_VM_ABI_DRAFT_VERSION;
 	result.structure_size = sizeof(result);
@@ -2061,13 +2485,23 @@ AMDVMProbeUserClient::vmVcpuCreate(IOExternalMethodArguments *arguments)
 	if (context) {
 		bzero(context, sizeof(*context));
 		__sync_fetch_and_add(&gVcpuContextCount, 1u);
-		result.context_status = amdvm_hlt_context_init_qemu_reset_vector_v1(context);
+		result.context_status = ensureVmSharedContextLocked();
+		if (!result.context_status) {
+			result.context_status =
+			    amdvm_hlt_context_init_qemu_reset_vector_v1(context);
+		}
 		if (!result.context_status) {
 			bcopy(fVmResetRom, context->guest_payload, AMDVM_VCPU_RESET_ROM_SIZE);
-			size_t pages = 0;
-			result.context_status = amdvm_hlt_context_attach_vm_memory(context,
-			    fVmMemory, fVmGeneration, &pages);
-			if (!result.context_status) result.npt_page_count = pages;
+			size_t pages = fVmSharedContext->npt.pages_used;
+			result.context_status = amdvm_hlt_context_attach_shared_npt(context,
+			    fVmMemory, fVmGeneration, &fVmSharedContext->npt, pages,
+			    &fVmSharedContext->host_mtrr);
+			if (!result.context_status) {
+				/* This vCPU executes the template's mapped reset page. */
+				context->guest_payload_pa =
+				    fVmSharedContext->guest_payload_pa;
+				result.npt_page_count = pages;
+			}
 		}
 		amdvm_vm_cpu_state_t *state = nullptr;
 		if (!result.context_status) {
@@ -2083,14 +2517,24 @@ AMDVMProbeUserClient::vmVcpuCreate(IOExternalMethodArguments *arguments)
 			fVmCpus[request->vcpu_id] = {};
 			fVmCpus[request->vcpu_id].context = context;
 			fVmCpus[request->vcpu_id].state = state;
+			fVmCpus[request->vcpu_id].runInput = runInput;
+			fVmCpus[request->vcpu_id].runOutput = runOutput;
+			fVmCpus[request->vcpu_id].runLock = runLock;
 			fVmCpus[request->vcpu_id].apicId = request->apic_id;
 			fVmCpus[request->vcpu_id].resetProfile = request->reset_profile;
-			fVmCpus[request->vcpu_id].runCpu = UINT32_MAX;
+			fVmCpus[request->vcpu_id].hot.runCpu = UINT32_MAX;
 		} else {
+			IOFree(runInput, AMDVM_VM_ABI_DRAFT_VCPU_RUN_REQUEST_V3_SIZE);
+			IOFree(runOutput, sizeof(amdvm_vm_abi_draft_vcpu_run_result_t));
+			IOSimpleLockFree(runLock);
 			if (state) IOFree(state, sizeof(*state));
 			IOFree(context, sizeof(*context));
 			__sync_fetch_and_sub(&gVcpuContextCount, 1u);
 		}
+	} else {
+		IOFree(runInput, AMDVM_VM_ABI_DRAFT_VCPU_RUN_REQUEST_V3_SIZE);
+		IOFree(runOutput, sizeof(amdvm_vm_abi_draft_vcpu_run_result_t));
+		IOSimpleLockFree(runLock);
 	}
 	IOLockUnlock(fVmLock);
 	bcopy(&result, arguments->structureOutput, sizeof(result));
@@ -2121,8 +2565,13 @@ AMDVMProbeUserClient::vmVcpuDestroy(IOExternalMethodArguments *arguments)
 		IOLockUnlock(fVmLock); return kIOReturnNotReady;
 	}
 	auto &slot = fVmCpus[request->vcpu_id];
-	if (__sync_val_compare_and_swap(&slot.activeRuns, 0u, 0u) != 0) {
-		slot.closing = true;
+	if (!slot.context) {
+		IOLockUnlock(fVmLock);
+		return kIOReturnNotReady;
+	}
+	amdvm_run_slot_begin_destroy(&slot.hot.runState);
+	if (!amdvm_run_slot_wait_quiescent(fVmLock, &slot.hot.runState,
+	    &slot.hot.runBufferBusy)) {
 		IOLockUnlock(fVmLock); return kIOReturnBusy;
 	}
 	result.abi_version = AMDVM_VM_ABI_DRAFT_VERSION;
@@ -2133,6 +2582,11 @@ AMDVMProbeUserClient::vmVcpuDestroy(IOExternalMethodArguments *arguments)
 		if (!result.context_status) {
 			IOFree(slot.context, sizeof(*slot.context));
 			if (slot.state) IOFree(slot.state, sizeof(*slot.state));
+			if (slot.runInput)
+				IOFree(slot.runInput, AMDVM_VM_ABI_DRAFT_VCPU_RUN_REQUEST_V3_SIZE);
+			if (slot.runOutput)
+				IOFree(slot.runOutput, sizeof(amdvm_vm_abi_draft_vcpu_run_result_t));
+			if (slot.runLock) IOSimpleLockFree(slot.runLock);
 			slot = {};
 			__sync_fetch_and_sub(&gVcpuContextCount, 1u);
 		}
@@ -2178,20 +2632,24 @@ AMDVMProbeUserClient::vmVcpuState(IOExternalMethodArguments *arguments, bool set
 	    !slot.state || !slot.state->valid || !slot.context->initialized || slot.context->failed) {
 		IOLockUnlock(fVmLock); return kIOReturnNotReady;
 	}
-	if (slot.closing || __sync_val_compare_and_swap(&slot.activeRuns, 0u, 0u) != 0) {
+	if (amdvm_run_slot_try_acquire(&slot.hot.runState) != 1) {
 		IOLockUnlock(fVmLock); return kIOReturnBusy;
 	}
 	auto *context = slot.context;
 	if (context->lease.active || !__sync_bool_compare_and_swap(&context->busy, 0u, 1u)) {
+		(void)amdvm_run_slot_release(&slot.hot.runState);
 		IOLockUnlock(fVmLock); return kIOReturnBusy;
 	}
+	auto *state = slot.state;
+	uint64_t mapGeneration = fVmGeneration;
+	IOLockUnlock(fVmLock);
 	if (set) {
 		const auto *stateRequest = static_cast<const amdvm_vm_abi_draft_vcpu_state_request_t *>(input.bytes());
 		auto *result = static_cast<amdvm_vm_abi_draft_lifecycle_result_t *>(output.bytes());
 		result->abi_version = AMDVM_VM_ABI_DRAFT_VERSION;
 		result->structure_size = static_cast<uint32_t>(resultSize);
-		result->map_generation = fVmGeneration;
-		result->context_status = amdvm_vm_cpu_state_set(slot.state, context->guest_vmcb,
+		result->map_generation = mapGeneration;
+		result->context_status = amdvm_vm_cpu_state_set(state, context->guest_vmcb,
 		    reinterpret_cast<uint64_t *>(context->guest_gprs), context->guest_xstate,
 		    &stateRequest->state) ? AMDVM_HLT_CONTEXT_INVALID_GUEST : 0;
 		if (!result->context_status) context->guest_execution_xcr0 =
@@ -2201,13 +2659,15 @@ AMDVMProbeUserClient::vmVcpuState(IOExternalMethodArguments *arguments, bool set
 		result->abi_version = AMDVM_VM_ABI_DRAFT_VERSION;
 		result->structure_size = static_cast<uint32_t>(resultSize);
 		result->vcpu_id = request->vcpu_id;
-		result->map_generation = fVmGeneration;
-		result->context_status = amdvm_vm_cpu_state_get(slot.state, context->guest_vmcb,
+		result->map_generation = mapGeneration;
+		result->context_status = amdvm_vm_cpu_state_get(state, context->guest_vmcb,
 		    reinterpret_cast<const uint64_t *>(context->guest_gprs), context->guest_xstate,
 		    &result->state) ? AMDVM_HLT_CONTEXT_INVALID_GUEST : 0;
 	}
 	__sync_lock_release(&context->busy);
-	IOLockUnlock(fVmLock);
+	(void)amdvm_run_slot_release(&slot.hot.runState);
+	amdvm_run_slot_wake_if_quiescent(fVmLock, &slot.hot.runState,
+	    &slot.hot.runBufferBusy);
 	return output.copyTo(arguments);
 }
 
@@ -2254,24 +2714,28 @@ AMDVMProbeUserClient::vmVcpuDiagnostic(IOExternalMethodArguments *arguments)
 		IOLockUnlock(fVmLock);
 		return kIOReturnNotReady;
 	}
-	if (slot.closing || __sync_val_compare_and_swap(&slot.activeRuns, 0u, 0u) != 0) {
+	if (amdvm_run_slot_try_acquire(&slot.hot.runState) != 1) {
 		IOLockUnlock(fVmLock);
 		return kIOReturnBusy;
 	}
 	auto *context = slot.context;
 	if (context->lease.active || !__sync_bool_compare_and_swap(&context->busy, 0u, 1u)) {
+		(void)amdvm_run_slot_release(&slot.hot.runState);
 		IOLockUnlock(fVmLock);
 		return kIOReturnBusy;
 	}
+	uint32_t resetProfile = slot.resetProfile;
+	uint64_t mapGeneration = fVmGeneration;
+	IOLockUnlock(fVmLock);
 	auto *result = static_cast<amdvm_vm_abi_draft_vcpu_diagnostic_result_t *>(output.bytes());
 	result->abi_version = AMDVM_VM_ABI_DRAFT_VERSION;
 	result->structure_size = sizeof(*result);
 	result->vcpu_id = request->vcpu_id;
-	result->map_generation = fVmGeneration;
+	result->map_generation = mapGeneration;
 	result->context_status = AMDVM_HLT_CONTEXT_OK;
 	result->snapshot.abi_version = AMDVM_VCPU_ABI_VERSION;
 	result->snapshot.context_status = AMDVM_HLT_CONTEXT_OK;
-	result->snapshot.guest_profile = slot.resetProfile;
+	result->snapshot.guest_profile = resetProfile;
 	result->snapshot.guest_physical_address = AMDVM_VCPU_RESET_ROM_GPA;
 	result->snapshot.rom_offset = AMDVM_VCPU_RESET_ROM_OFFSET;
 	result->snapshot.flags |= AMDVM_VCPU_DIAGNOSTIC_ROM_INSTALLED;
@@ -2334,7 +2798,9 @@ AMDVMProbeUserClient::vmVcpuDiagnostic(IOExternalMethodArguments *arguments)
 		result->snapshot.flags |= AMDVM_VCPU_DIAGNOSTIC_RESET_STATE;
 	}
 	__sync_lock_release(&context->busy);
-	IOLockUnlock(fVmLock);
+	(void)amdvm_run_slot_release(&slot.hot.runState);
+	amdvm_run_slot_wake_if_quiescent(fVmLock, &slot.hot.runState,
+	    &slot.hot.runBufferBusy);
 	return output.copyTo(arguments);
 }
 
@@ -2404,8 +2870,14 @@ AMDVMProbeUserClient::vmVcpuSetMemoryTypes(IOExternalMethodArguments *arguments)
 	} else {
 		auto &slot = fVmCpus[request->vcpu_id];
 		auto *context = slot.context;
-		if (slot.closing ||
-		    __sync_val_compare_and_swap(&slot.activeRuns, 0u, 0u) != 0) {
+		bool anyActiveRun = false;
+		for (uint32_t i = 0; i < AMDVM_VM_ABI_DRAFT_MAX_VCPUS; ++i) {
+			if (amdvm_run_slot_refcount(&fVmCpus[i].hot.runState) != 0) {
+				anyActiveRun = true;
+				break;
+			}
+		}
+		if (amdvm_run_slot_is_closing(&slot.hot.runState) || anyActiveRun) {
 			status = kIOReturnBusy;
 		}
 		else if (!context->initialized || context->failed || context->lease.active) {
@@ -2441,12 +2913,19 @@ AMDVMProbeUserClient::vmVcpuKick(IOExternalMethodArguments *arguments)
 	    arguments->structureOutputSize < sizeof(result))
 		return kIOReturnBadArgument;
 	request = static_cast<const amdvm_vm_abi_draft_vcpu_kick_request_t *>(input.bytes());
+	bool reportPauseStats = request->flags ==
+	    AMDVM_VM_ABI_DRAFT_VCPU_KICK_REPORT_PAUSE_STATS;
 	if (request->abi_version != AMDVM_VM_ABI_DRAFT_VERSION ||
 	    request->structure_size != sizeof(*request) ||
-	    request->flags != AMDVM_VM_ABI_DRAFT_VCPU_KICK_HOST_SIGNAL_SENT ||
+	    (request->flags != AMDVM_VM_ABI_DRAFT_VCPU_KICK_HOST_SIGNAL_SENT &&
+	     !reportPauseStats) ||
 	    request->vcpu_id >= AMDVM_VM_ABI_DRAFT_MAX_VCPUS ||
-	    request->map_generation == 0 || request->kick_generation == 0)
+	    request->map_generation == 0 ||
+	    (!reportPauseStats && request->kick_generation == 0))
 		return kIOReturnBadArgument;
+#if !defined(AMDVM_EXPERIMENTAL_PROVIDER_PAUSE)
+	if (reportPauseStats) return kIOReturnUnsupported;
+#endif
 	if (IOUserClient::clientHasPrivilege(fSecurityID,
 	    kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
 		return kIOReturnNotPrivileged;
@@ -2460,9 +2939,10 @@ AMDVMProbeUserClient::vmVcpuKick(IOExternalMethodArguments *arguments)
 		IOLockUnlock(fVmLock);
 		return kIOReturnNotReady;
 	}
-	current = __sync_val_compare_and_swap(&slot.kickGeneration, 0u, 0u);
-	while (amdvm_generation_newer(request->kick_generation, current)) {
-		previous = __sync_val_compare_and_swap(&slot.kickGeneration, current,
+	current = __sync_val_compare_and_swap(&slot.hot.kickGeneration, 0u, 0u);
+	while (amdvm_kick_generation_should_update(request->kick_generation,
+	    current, reportPauseStats)) {
+		previous = __sync_val_compare_and_swap(&slot.hot.kickGeneration, current,
 		    request->kick_generation);
 		if (previous == current) {
 			current = request->kick_generation;
@@ -2475,7 +2955,38 @@ AMDVMProbeUserClient::vmVcpuKick(IOExternalMethodArguments *arguments)
 	result.vcpu_id = request->vcpu_id;
 	result.map_generation = fVmGeneration;
 	result.kick_generation = current;
+	uint64_t pauseEntries = __sync_val_compare_and_swap(
+	    &slot.pause.fastPathEntries, 0u, 0u);
+	uint64_t pauseHandled = __sync_val_compare_and_swap(
+	    &slot.pause.handled, 0u, 0u);
+	uint64_t pauseBudget = __sync_val_compare_and_swap(
+	    &slot.pause.returnsBudget, 0u, 0u);
+	uint64_t pauseEvents = __sync_val_compare_and_swap(
+	    &slot.pause.returnsEvent, 0u, 0u);
+	uint64_t pauseUnhandled = __sync_val_compare_and_swap(
+	    &slot.pause.returnsUnhandled, 0u, 0u);
 	IOLockUnlock(fVmLock);
+	if (reportPauseStats) {
+#if defined(AMDVM_EXPERIMENTAL_PROVIDER_PAUSE)
+		amdvm_pause_stats_report(request->vcpu_id, current, pauseEntries,
+		    pauseHandled, pauseBudget, pauseEvents, pauseUnhandled);
+#endif
+	#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+		amdvm_provider_timing_report(request->vcpu_id,
+		    __sync_val_compare_and_swap(&slot.timing.runs, 0u, 0u),
+		    __sync_val_compare_and_swap(&slot.timing.stateSetTicks, 0u, 0u),
+		    __sync_val_compare_and_swap(&slot.timing.xstatePreflightTicks, 0u, 0u),
+		    __sync_val_compare_and_swap(&slot.timing.interruptOffTicks, 0u, 0u),
+		    __sync_val_compare_and_swap(&slot.timing.vmrunTicks, 0u, 0u),
+		    __sync_val_compare_and_swap(&slot.timing.stateGetTicks, 0u, 0u),
+		    __sync_val_compare_and_swap(&slot.timing.memoryTypeCheckTicks, 0u, 0u),
+		    __sync_val_compare_and_swap(&slot.timing.ownerAcquireTicks, 0u, 0u),
+		    __sync_val_compare_and_swap(&slot.timing.vmcbPrepareTicks, 0u, 0u),
+		    __sync_val_compare_and_swap(&slot.timing.vmrunXstateTicks, 0u, 0u),
+		    __sync_val_compare_and_swap(&slot.timing.ownerReleaseTicks, 0u, 0u),
+		    __sync_val_compare_and_swap(&slot.timing.vmrunSamples, 0u, 0u));
+	#endif
+	}
 	/*
 	 * The caller sends QEMU's host-thread signal before this latch update. This
 	 * selector only records the generation and never waits on a running vCPU or
@@ -2491,13 +3002,20 @@ AMDVMProbeUserClient::vmVcpuKick(IOExternalMethodArguments *arguments)
 IOReturn
 AMDVMProbeUserClient::vmVcpuRun(IOExternalMethodArguments *arguments)
 {
+	return vmVcpuRunInternal(arguments, -1);
+}
+
+IOReturn
+AMDVMProbeUserClient::vmVcpuRunInternal(IOExternalMethodArguments *arguments,
+	int32_t expectedVcpuId, bool borrowSharedInput)
+{
 	AMDVMObjectRetainGuard lifetime(this);
-	AMDVMStructureInput input;
+	AMDVMRunBufferGuard bufferGuard;
 	AMDVMStructureOutput output;
 	IOSimpleLock *runLock = nullptr;
 	thread_t initialThread = THREAD_NULL;
 	IOInterruptState interruptState = FALSE;
-	uint64_t xcr0 = 0, cr0Before = 0, cr0After = 0;
+	uint64_t cr0Before = 0, cr0After = 0;
 	int cpuBefore = -1, cpuAfter = -1;
 	int firstCaptureStatus = AMDVM_VMRUN_INVALID_ARGUMENT;
 	int secondCaptureStatus = AMDVM_VMRUN_INVALID_ARGUMENT;
@@ -2510,37 +3028,61 @@ AMDVMProbeUserClient::vmVcpuRun(IOExternalMethodArguments *arguments)
 	amdvm_vm_abi_draft_vcpu_run_result_t *result;
 	amdvm_hlt_context_t *context = nullptr;
 	amdvm_vm_cpu_state_t *state = nullptr;
+	void *runInputBuffer = nullptr;
+	void *runOutputBuffer = nullptr;
+	IOMemoryDescriptor *inputDescriptor = nullptr;
+	bool descriptorPrepared = false;
+	amdvm_run_request_header_t requestHeader = {};
 	uint32_t vcpuId = UINT32_MAX;
 	uint64_t generation = 0;
-	bool activeReference = false;
+	uint64_t pinnedGeneration = 0;
+#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+	uint64_t timingPhaseStarted = 0;
+	uint64_t interruptOffElapsedTicks = 0;
+	uint64_t interruptOffStartTicks = 0;
+#endif
 	bool interruptsDisabled = false;
 	bool patPrepared = false;
 	bool nmiIretStepArmed = false;
+	bool diagnosticGpIntercept = false;
+	bool diagnosticPfIntercept = false;
+	bool nativeRdtsc = false;
+	bool nativeCr3 = false;
+	bool pauseRequested = false;
+	uint32_t savedMisc1 = 0;
+	bool nativeRdtscPrepared = false;
+	bool exceptionInterceptsSaved = false;
 	uint32_t savedExceptionIntercepts = 0;
+	uint32_t diagnosticSavedExceptionIntercepts = 0;
+	uint32_t diagnosticExceptionMask = 0;
 	uint64_t originalGuestRflags = 0;
+	uint64_t pauseDeadline = 0;
+	uint32_t pauseHandled = 0;
+	bool pauseLoopStarted = false;
+	bool pauseDeadlineInitialized = false;
+	bool pauseAdvancePending = false;
+	bool maskedQemuEventPossible = false;
 	int contextRunStatus = AMDVM_HLT_CONTEXT_INVALID;
+	int stateSetStatus = 0;
 	size_t outputSize = sizeof(amdvm_vm_abi_draft_vcpu_run_result_t);
+	size_t inputSize = 0;
 	IOReturn outputStatus = kIOReturnSuccess;
 
-	if (!arguments ||
-	    !input.init(arguments, sizeof(amdvm_vm_abi_draft_vcpu_run_request_t)) ||
-	    !output.init(outputSize))
+	if (!arguments || expectedVcpuId < -1 ||
+	    expectedVcpuId >= (int32_t)AMDVM_VM_ABI_DRAFT_MAX_VCPUS)
 		return kIOReturnBadArgument;
-	if ((arguments->structureOutputDescriptor &&
+	inputDescriptor = arguments->structureInputDescriptor;
+	inputSize = inputDescriptor != nullptr ?
+	    (size_t)inputDescriptor->getLength() : (size_t)arguments->structureInputSize;
+	if ((inputSize != AMDVM_VM_ABI_DRAFT_VCPU_RUN_REQUEST_V2_SIZE &&
+	    inputSize != AMDVM_VM_ABI_DRAFT_VCPU_RUN_REQUEST_V3_SIZE) ||
+	    (borrowSharedInput && (expectedVcpuId < 0 || inputDescriptor != nullptr)) ||
+	    (inputDescriptor != nullptr && arguments->structureInputSize != 0) ||
+	    (inputDescriptor == nullptr && arguments->structureInput == nullptr) ||
+	    (arguments->structureOutputDescriptor &&
 	    arguments->structureOutputDescriptor->getLength() < outputSize) ||
 	    (!arguments->structureOutputDescriptor && (!arguments->structureOutput ||
 	    arguments->structureOutputSize < outputSize)))
-		return kIOReturnBadArgument;
-	request = static_cast<const amdvm_vm_abi_draft_vcpu_run_request_t *>(input.bytes());
-	result = static_cast<amdvm_vm_abi_draft_vcpu_run_result_t *>(output.bytes());
-	if (request->abi_version != AMDVM_VM_ABI_DRAFT_VERSION ||
-	    request->structure_size != sizeof(*request) ||
-	    !amdvm_vm_abi_draft_memory_map_flags_valid(request->flags) ||
-	    request->vcpu_id >= AMDVM_VM_ABI_DRAFT_MAX_VCPUS ||
-	    request->map_generation == 0 ||
-	    amdvm_vmcb_validate_x86_state_v1(&request->state) != 0 ||
-	    amdvm_vmcb_validate_event_injection(request->event_injection,
-	    request->event_injection_error_code) != 0)
 		return kIOReturnBadArgument;
 	if (IOUserClient::clientHasPrivilege(fSecurityID,
 	    kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
@@ -2548,7 +3090,129 @@ AMDVMProbeUserClient::vmVcpuRun(IOExternalMethodArguments *arguments)
 	if (amdvm_client_mode_accepts(&fApiMode, AMDVM_CLIENT_MODE_VM_SCOPED) !=
 	    AMDVM_CLIENT_MODE_OK)
 		return kIOReturnNotPermitted;
-
+	if (inputDescriptor != nullptr) {
+		if (inputDescriptor->prepare() != kIOReturnSuccess)
+			return kIOReturnBadArgument;
+		descriptorPrepared = true;
+		if (inputDescriptor->readBytes(0, &requestHeader,
+		    sizeof(requestHeader)) != sizeof(requestHeader)) {
+			(void)inputDescriptor->complete();
+			return kIOReturnBadArgument;
+		}
+	} else {
+		bcopy(arguments->structureInput, &requestHeader, sizeof(requestHeader));
+	}
+	if (amdvm_run_buffer_header_validate(&requestHeader, inputSize,
+	    AMDVM_VM_ABI_DRAFT_VCPU_RUN_REQUEST_V2_SIZE,
+	    AMDVM_VM_ABI_DRAFT_VCPU_RUN_REQUEST_V3_SIZE,
+	    AMDVM_VM_ABI_DRAFT_MAX_VCPUS, &vcpuId) != 0) {
+		if (descriptorPrepared) (void)inputDescriptor->complete();
+		return kIOReturnBadArgument;
+	}
+	if (amdvm_run_buffer_vcpu_matches(vcpuId, expectedVcpuId,
+	    AMDVM_VM_ABI_DRAFT_MAX_VCPUS) != 0) {
+		if (descriptorPrepared) (void)inputDescriptor->complete();
+		return kIOReturnBadArgument;
+	}
+	IOLockLock(fVmLock);
+	auto &reservedSlot = fVmCpus[vcpuId];
+	if (fVmClosed || !fVmMemory || fVmPending || !reservedSlot.context ||
+	    !reservedSlot.state || !reservedSlot.runInput || !reservedSlot.runOutput ||
+	    !reservedSlot.runLock || !reservedSlot.state->valid ||
+	    !reservedSlot.context->initialized || reservedSlot.context->failed ||
+	    !reservedSlot.context->guest_memory_mapped ||
+	    !reservedSlot.context->memory_type_count ||
+	    reservedSlot.context->lease.active) {
+		IOLockUnlock(fVmLock);
+		if (descriptorPrepared) (void)inputDescriptor->complete();
+		return kIOReturnNotReady;
+	}
+	if (amdvm_run_slot_try_acquire(&reservedSlot.hot.runState) != 1) {
+		IOLockUnlock(fVmLock);
+		if (descriptorPrepared) (void)inputDescriptor->complete();
+		return kIOReturnBusy;
+	}
+	if (!amdvm_run_buffer_try_reserve(&reservedSlot.hot.runBufferBusy)) {
+		(void)amdvm_run_slot_release(&reservedSlot.hot.runState);
+		IOLockUnlock(fVmLock);
+		if (descriptorPrepared) (void)inputDescriptor->complete();
+		return kIOReturnBusy;
+	}
+	bufferGuard.acquire(fVmLock, &reservedSlot.hot.runState,
+	    &reservedSlot.hot.runBufferBusy, true);
+	context = reservedSlot.context;
+	state = reservedSlot.state;
+	pinnedGeneration = fVmGeneration;
+	runInputBuffer = reservedSlot.runInput;
+	runOutputBuffer = reservedSlot.runOutput;
+	runLock = reservedSlot.runLock;
+	IOLockUnlock(fVmLock);
+	if (!amdvm_run_structure_requires_staging_copy(inputDescriptor != nullptr)) {
+		/* In-band structureInput belongs to this synchronous IOUserClient call.
+		 * Shared RUN additionally owns the slot through COMPLETE and retains its
+		 * memory descriptor. Both sources stay stable until this method returns. */
+		request = static_cast<const amdvm_vm_abi_draft_vcpu_run_request_t *>(
+		    arguments->structureInput);
+	} else {
+		IOByteCount inputCopied = inputDescriptor != nullptr ?
+		    inputDescriptor->readBytes(0, runInputBuffer, inputSize) :
+		    (bcopy(arguments->structureInput, runInputBuffer, inputSize), inputSize);
+		IOReturn inputComplete = descriptorPrepared ? inputDescriptor->complete() :
+		    kIOReturnSuccess;
+		descriptorPrepared = false;
+		if (inputCopied != inputSize || inputComplete != kIOReturnSuccess)
+			return kIOReturnBadArgument;
+		request = static_cast<const amdvm_vm_abi_draft_vcpu_run_request_t *>(
+		    runInputBuffer);
+	}
+	/* Inline output is an in-band IPC buffer owned by this synchronous
+	 * IOUserClient call. Write there directly; OOL descriptors still stage. */
+	void *outputBuffer = !amdvm_run_structure_requires_staging_copy(
+	    arguments->structureOutputDescriptor != nullptr) ?
+	    arguments->structureOutput : runOutputBuffer;
+	if (!output.initWithBuffer(outputBuffer, outputSize))
+		return kIOReturnBadArgument;
+	result = static_cast<amdvm_vm_abi_draft_vcpu_run_result_t *>(output.bytes());
+	if (request->abi_version != AMDVM_VM_ABI_DRAFT_VERSION ||
+	    request->structure_size != inputSize ||
+	    (request->flags &
+	      ~(AMDVM_VM_ABI_DRAFT_VCPU_RUN_DIAGNOSTIC_INTERCEPT_GP |
+	        AMDVM_VM_ABI_DRAFT_VCPU_RUN_DIAGNOSTIC_INTERCEPT_PF |
+	        AMDVM_VM_ABI_DRAFT_VCPU_RUN_NATIVE_RDTSC |
+	        AMDVM_VM_ABI_DRAFT_VCPU_RUN_MTRR_CACHE |
+	        AMDVM_VM_ABI_DRAFT_VCPU_RUN_PROVIDER_PAUSE |
+	        AMDVM_VM_ABI_DRAFT_VCPU_RUN_NATIVE_CR3)) != 0 ||
+	    request->vcpu_id >= AMDVM_VM_ABI_DRAFT_MAX_VCPUS ||
+	    request->vcpu_id != vcpuId ||
+	    amdvm_run_buffer_vcpu_matches(request->vcpu_id, expectedVcpuId,
+	    AMDVM_VM_ABI_DRAFT_MAX_VCPUS) != 0 ||
+	    request->map_generation == 0 ||
+	    amdvm_vmcb_validate_x86_state_v1(&request->state) != 0 ||
+	    (((request->flags &
+	       AMDVM_VM_ABI_DRAFT_VCPU_RUN_DIAGNOSTIC_INTERCEPT_PF) != 0) ?
+	     amdvm_vmcb_validate_event_injection_diagnostic_pf(
+	        request->event_injection,
+	        request->event_injection_error_code) :
+	     amdvm_vmcb_validate_event_injection(request->event_injection,
+	        request->event_injection_error_code)) != 0)
+		return kIOReturnBadArgument;
+	diagnosticGpIntercept = (request->flags &
+	    AMDVM_VM_ABI_DRAFT_VCPU_RUN_DIAGNOSTIC_INTERCEPT_GP) != 0;
+	diagnosticPfIntercept = (request->flags &
+	    AMDVM_VM_ABI_DRAFT_VCPU_RUN_DIAGNOSTIC_INTERCEPT_PF) != 0;
+	nativeRdtsc = (request->flags &
+	    AMDVM_VM_ABI_DRAFT_VCPU_RUN_NATIVE_RDTSC) != 0;
+	nativeCr3 = (request->flags &
+	    AMDVM_VM_ABI_DRAFT_VCPU_RUN_NATIVE_CR3) != 0;
+	pauseRequested = (request->flags &
+	    AMDVM_VM_ABI_DRAFT_VCPU_RUN_PROVIDER_PAUSE) != 0;
+#if !defined(AMDVM_EXPERIMENTAL_NATIVE_CR3)
+	if (nativeCr3) return kIOReturnUnsupported;
+#endif
+	if (nativeCr3 && (request->state.cr[4] & (UINT64_C(1) << 17)))
+		return kIOReturnUnsupported;
+	if (nativeRdtsc && inputSize != AMDVM_VM_ABI_DRAFT_VCPU_RUN_REQUEST_V3_SIZE)
+		return kIOReturnBadArgument;
 	result->abi_version = AMDVM_VM_ABI_DRAFT_VERSION;
 	result->structure_size = sizeof(*result);
 	result->vcpu_id = request->vcpu_id;
@@ -2560,52 +3224,60 @@ AMDVMProbeUserClient::vmVcpuRun(IOExternalMethodArguments *arguments)
 	result->state = request->state;
 	vcpuId = request->vcpu_id;
 	generation = request->map_generation;
-
-	IOLockLock(fVmLock);
-	if (fVmClosed || !fVmMemory || fVmPending || generation != fVmGeneration) {
-		IOLockUnlock(fVmLock);
+	if (generation != pinnedGeneration ||
+	    amdvm_run_slot_is_closing(&fVmCpus[vcpuId].hot.runState)) {
 		return kIOReturnNotReady;
 	}
 	auto &slot = fVmCpus[vcpuId];
-	context = slot.context;
-	state = slot.state;
-	if (!context || !state || !state->valid || !context->initialized ||
-	    context->failed || !context->guest_memory_mapped || slot.closing ||
-	    !context->memory_type_count || context->lease.active ||
-	    __sync_val_compare_and_swap(&slot.activeRuns, 0u, 0u) != 0) {
-		IOLockUnlock(fVmLock);
-		return kIOReturnNotReady;
-	}
 	if (request->kick_generation != __sync_val_compare_and_swap(
-	    &slot.kickGeneration, 0u, 0u)) {
+	    &slot.hot.kickGeneration, 0u, 0u)) {
 		result->flags = AMDVM_VCPU_RUN_KICKED;
 		result->context_status = AMDVM_HLT_CONTEXT_OK;
 		result->owner_status = AMDVM_SVM_OWNER_OK;
 		result->run_status = AMDVM_VMRUN_SUCCESS;
 		result->state = request->state;
-		IOLockUnlock(fVmLock);
 		return output.copyTo(arguments);
 	}
-	if (amdvm_vm_cpu_state_set(state, context->guest_vmcb,
+	__sync_lock_test_and_set(&slot.hot.runGeneration, request->kick_generation);
+	__sync_lock_test_and_set(&slot.hot.runCpu, UINT32_MAX);
+
+	/* The active reference pins context/state against destroy and state APIs.
+	 * Stage the large architectural state and VMCB fields outside fVmLock so
+	 * another vCPU does not queue behind this copy. */
+	context->vmcb_clean_candidates = amdvm_vmcb_state_clean_candidates(
+	    context->guest_vmcb, &request->state);
+#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+	timingPhaseStarted = mach_absolute_time();
+#endif
+	stateSetStatus = amdvm_vm_cpu_state_set_validated(state, context->guest_vmcb,
 	    reinterpret_cast<uint64_t *>(context->guest_gprs), context->guest_xstate,
-	    &request->state) != 0) {
-		result->context_status = AMDVM_HLT_CONTEXT_INVALID_GUEST;
-		IOLockUnlock(fVmLock);
-		return output.copyTo(arguments);
+	    &request->state);
+#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+	__sync_fetch_and_add(&slot.timing.stateSetTicks,
+	    mach_absolute_time() - timingPhaseStarted);
+#endif
+	if (stateSetStatus != 0) {
+		contextStatus = AMDVM_HLT_CONTEXT_INVALID_GUEST;
+		goto run_done;
 	}
 	if (request->state.interruptibility &
 	    AMDVM_X86_INTERRUPTIBILITY_NMI_IRET_STEP) {
 		originalGuestRflags = request->state.rflags;
 		if (amdvm_vmcb_arm_nmi_iret_step(context->guest_vmcb,
 		    &request->state, &savedExceptionIntercepts) != 0) {
-			result->context_status = AMDVM_HLT_CONTEXT_INVALID_GUEST;
-			IOLockUnlock(fVmLock);
-			return output.copyTo(arguments);
+			contextStatus = AMDVM_HLT_CONTEXT_INVALID_GUEST;
+			goto run_done;
 		}
 		nmiIretStepArmed = true;
 	}
 	context->guest_execution_xcr0 = amdvm_xstate_execution_mask(
 	    request->state.xcr0, request->state.cr[4]);
+	if (pauseRequested && !amdvm_provider_pause_cycle_enabled()) {
+		contextStatus = AMDVM_HLT_CONTEXT_INVALID_GUEST;
+		goto run_done;
+	}
+	context->host_mtrr_cache_enabled =
+	    (request->flags & AMDVM_VM_ABI_DRAFT_VCPU_RUN_MTRR_CACHE) != 0;
 	amdvm_vmcb_set_u64(context->guest_vmcb, AMDVM_VMCB_EVENT_INJECTION,
 	    ((uint64_t)request->event_injection_error_code << 32) |
 	    request->event_injection);
@@ -2618,11 +3290,6 @@ AMDVMProbeUserClient::vmVcpuRun(IOExternalMethodArguments *arguments)
 	context->guest_vmcb->bytes[AMDVM_VMCB_DECODE_ASSIST_LENGTH] = 0;
 	memset(&context->guest_vmcb->bytes[AMDVM_VMCB_DECODE_ASSIST_BYTES], 0xcc,
 	    AMDVM_VMCB_DECODE_ASSIST_MAX);
-	__sync_lock_test_and_set(&slot.runGeneration, request->kick_generation);
-	__sync_lock_test_and_set(&slot.runCpu, UINT32_MAX);
-	__sync_fetch_and_add(&slot.activeRuns, 1u);
-	activeReference = true;
-	IOLockUnlock(fVmLock);
 
 	if (__sync_val_compare_and_swap(&gHltFpuPreflightPassed, 0u, 0u) == 0) {
 		contextStatus = AMDVM_HLT_CONTEXT_FPU_PREFLIGHT_REQUIRED;
@@ -2634,15 +3301,45 @@ AMDVMProbeUserClient::vmVcpuRun(IOExternalMethodArguments *arguments)
 		goto run_done;
 	}
 	patPrepared = true;
-	runLock = IOSimpleLockAlloc();
-	if (!runLock) {
-		contextStatus = AMDVM_HLT_CONTEXT_ALLOC_FAILED;
-		goto run_done;
+	/* These are VMCB control-area edits only. Finish them while interrupts are
+	 * enabled; the pinned XSAVE helper below returns with the CPU pinned and
+	 * local interrupts disabled for the SVM lease/VMRUN window. */
+	if (diagnosticGpIntercept || diagnosticPfIntercept) {
+		if (diagnosticGpIntercept)
+			diagnosticExceptionMask |= UINT32_C(1) << AMDVM_VCPU_EXCEPTION_GP;
+		if (diagnosticPfIntercept)
+			diagnosticExceptionMask |= UINT32_C(1) << AMDVM_VCPU_EXCEPTION_PF;
+		if (amdvm_vmcb_add_exception_intercepts(context->guest_vmcb,
+		    diagnosticExceptionMask, &diagnosticSavedExceptionIntercepts) != 0) {
+			contextStatus = AMDVM_HLT_CONTEXT_INVALID_GUEST;
+			goto run_done;
+		}
+		exceptionInterceptsSaved = true;
+	}
+	if (nativeRdtsc) {
+		if (amdvm_vmcb_prepare_native_rdtsc(context->guest_vmcb,
+		    request->tsc_offset, &savedMisc1) != 0) {
+			contextStatus = AMDVM_HLT_CONTEXT_INVALID_GUEST;
+			goto run_done;
+		}
+		nativeRdtscPrepared = true;
 	}
 	initialThread = current_thread();
-	xstateStatus = amdvm_capture_xstate_pinned(context->host_xstate, &xcr0,
-	    initialThread, runLock, &cpuBefore, &cpuAfter, &cr0Before, &cr0After,
-	    &interruptState, &firstCaptureStatus, &secondCaptureStatus);
+	#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+	timingPhaseStarted = mach_absolute_time();
+	#endif
+	xstateStatus = amdvm_pin_run_context(context->host_xstate, initialThread,
+	    runLock, &cpuBefore, &cpuAfter, &cr0Before, &cr0After,
+	    &interruptState, &firstCaptureStatus, &secondCaptureStatus,
+	#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+	    &interruptOffStartTicks);
+	#else
+	    nullptr);
+	#endif
+#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+	__sync_fetch_and_add(&slot.timing.xstatePreflightTicks,
+	    mach_absolute_time() - timingPhaseStarted);
+	#endif
 	if (xstateStatus != AMDVM_VMRUN_SUCCESS) {
 		contextStatus = AMDVM_HLT_CONTEXT_VMRUN_FAILED;
 		vmrunStatus = (amdvm_vmrun_status_t)xstateStatus;
@@ -2655,10 +3352,10 @@ AMDVMProbeUserClient::vmVcpuRun(IOExternalMethodArguments *arguments)
 		vmrunStatus = AMDVM_VMRUN_FPU_NOT_READY;
 		goto run_done;
 	}
-	__sync_lock_test_and_set(&slot.runGeneration, request->kick_generation);
-	__sync_lock_test_and_set(&slot.runCpu, (uint32_t)cpuBefore);
+	__sync_lock_test_and_set(&slot.hot.runGeneration, request->kick_generation);
+	__sync_lock_test_and_set(&slot.hot.runCpu, (uint32_t)cpuBefore);
 	if (request->kick_generation != __sync_val_compare_and_swap(
-	    &slot.kickGeneration, 0u, 0u)) {
+	    &slot.hot.kickGeneration, 0u, 0u)) {
 		result->flags = AMDVM_VCPU_RUN_KICKED;
 		contextStatus = AMDVM_HLT_CONTEXT_OK;
 		ownerStatus = AMDVM_SVM_OWNER_OK;
@@ -2666,8 +3363,336 @@ AMDVMProbeUserClient::vmVcpuRun(IOExternalMethodArguments *arguments)
 		result->state = request->state;
 		goto run_done;
 	}
-	contextRunStatus = amdvm_hlt_context_run(context, &ownerStatus,
-	    &vmrunStatus, &exitSnapshot);
+#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+	timingPhaseStarted = mach_absolute_time();
+#endif
+	contextRunStatus = amdvm_vmapi_run_context(context, &ownerStatus,
+	    &vmrunStatus, &exitSnapshot, nativeCr3);
+	if (diagnosticPfIntercept && vmrunStatus == AMDVM_VMRUN_SUCCESS &&
+	    exitSnapshot.code == 0x04eULL && !slot.diagnosticPfLogged) {
+		/* Capture the first intercepted #PF only. QEMU may reinject ordinary
+		 * page faults while searching for the mapping mismatch; per-fault IOLog
+		 * would perturb the run and flood the kernel log. */
+		slot.diagnosticPfLogged = 1;
+		IOLog("AMDVM_FIRST_PF_VMCB_EVENT vcpu=%u code=0x%llx info1=0x%llx info2=0x%llx eventinj=0x%llx exit_int_info=0x%llx tlb_control=0x%llx clean=0x%llx\n",
+		    vcpuId, (unsigned long long)exitSnapshot.code,
+		    (unsigned long long)exitSnapshot.info1,
+		    (unsigned long long)exitSnapshot.info2,
+		    (unsigned long long)exitSnapshot.event_injection,
+		    (unsigned long long)exitSnapshot.exit_int_info,
+		    (unsigned long long)exitSnapshot.tlb_control,
+		    (unsigned long long)exitSnapshot.clean_bits);
+	}
+	if (context->host_mtrr_cache_refresh_needed) {
+		clock_interval_to_deadline(100u, kMillisecondScale,
+		    &context->host_mtrr_cache_deadline);
+		context->host_mtrr_cache_refresh_needed = 0;
+	}
+#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+	__sync_fetch_and_add(&slot.timing.vmrunTicks,
+	    mach_absolute_time() - timingPhaseStarted);
+	if (exitSnapshot.vmrun_samples != 0) {
+		__sync_fetch_and_add(&slot.timing.memoryTypeCheckTicks,
+		    exitSnapshot.memory_type_check_ticks);
+		__sync_fetch_and_add(&slot.timing.ownerAcquireTicks,
+		    exitSnapshot.owner_acquire_ticks);
+		__sync_fetch_and_add(&slot.timing.vmcbPrepareTicks,
+		    exitSnapshot.vmcb_prepare_ticks);
+		__sync_fetch_and_add(&slot.timing.vmrunXstateTicks,
+		    exitSnapshot.vmrun_xstate_ticks);
+		__sync_fetch_and_add(&slot.timing.ownerReleaseTicks,
+		    exitSnapshot.owner_release_ticks);
+		__sync_fetch_and_add(&slot.timing.vmrunSamples,
+		    exitSnapshot.vmrun_samples);
+	}
+#endif
+	if (contextRunStatus == AMDVM_HLT_CONTEXT_INVALID_GUEST &&
+	    vmrunStatus == AMDVM_VMRUN_SUCCESS &&
+	    __sync_bool_compare_and_swap(&gInvalidVmcbFailureReported, 0u, 1u)) {
+		/* One failure-only VMCB snapshot; never log on the VMEXIT hot path. */
+		uint64_t code = amdvm_vmcb_get_u64(context->guest_vmcb,
+		    AMDVM_VMCB_EXIT_CODE);
+		if (code == AMDVM_SVM_EXIT_INVALID) {
+			uint64_t cs = amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_CS);
+			uint64_t ss = amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_SS);
+			uint64_t ds = amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_DS);
+			uint64_t es = amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_ES);
+			uint64_t gdtr = amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_GDTR);
+			uint64_t idtr = amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_IDTR);
+			uint64_t ldtr = amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_LDTR);
+			uint64_t tr = amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_TR);
+			IOLog("AMDVM_VMEXIT_INVALID vcpu=%u vmcb_pa=0x%llx code=0x%llx info1=0x%llx info2=0x%llx next_rip=0x%llx rip=0x%llx rsp=0x%llx rflags=0x%llx eventinj=0x%llx exit_int_info=0x%llx clean=0x%llx run=%d owner=%d\n",
+			    vcpuId, (unsigned long long)context->guest_vmcb_pa,
+			    (unsigned long long)code,
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_EXIT_INFO1),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_EXIT_INFO2),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_NEXT_RIP),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_RIP),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_RSP),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_RFLAGS),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_EVENT_INJECTION),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_EXIT_INT_INFO),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_CLEAN_BITS), vmrunStatus, ownerStatus);
+			IOLog("AMDVM_VMEXIT_INVALID_CR cr0=0x%llx cr2=0x%llx cr3=0x%llx cr4=0x%llx efer=0x%llx dr6=0x%llx dr7=0x%llx rax=0x%llx pat=0x%llx cpl=0x%x\n",
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_CR0),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_CR2),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_CR3),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_CR4),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_EFER),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_DR6),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_DR7),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_RAX),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_PAT),
+			    context->guest_vmcb->bytes[AMDVM_VMCB_GUEST_CPL]);
+			IOLog("AMDVM_VMEXIT_INVALID_SEG cs=%04x/%03x/%08x/%016llx ss=%04x/%03x/%08x/%016llx ds=%04x/%03x/%08x/%016llx es=%04x/%03x/%08x/%016llx\n",
+			    (unsigned)(uint16_t)cs, (unsigned)(uint16_t)(cs >> 16),
+			    (unsigned)(uint32_t)(cs >> 32),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_CS + 8u),
+			    (unsigned)(uint16_t)ss, (unsigned)(uint16_t)(ss >> 16),
+			    (unsigned)(uint32_t)(ss >> 32),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_SS + 8u),
+			    (unsigned)(uint16_t)ds, (unsigned)(uint16_t)(ds >> 16),
+			    (unsigned)(uint32_t)(ds >> 32),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_DS + 8u),
+			    (unsigned)(uint16_t)es, (unsigned)(uint16_t)(es >> 16),
+			    (unsigned)(uint32_t)(es >> 32),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_ES + 8u));
+			IOLog("AMDVM_VMEXIT_INVALID_TABLE gdtr=%04x/%03x/%08x/%016llx idtr=%04x/%03x/%08x/%016llx ldtr=%04x/%03x/%08x/%016llx tr=%04x/%03x/%08x/%016llx\n",
+			    (unsigned)(uint16_t)gdtr, (unsigned)(uint16_t)(gdtr >> 16),
+			    (unsigned)(uint32_t)(gdtr >> 32),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_GDTR + 8u),
+			    (unsigned)(uint16_t)idtr, (unsigned)(uint16_t)(idtr >> 16),
+			    (unsigned)(uint32_t)(idtr >> 32),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_IDTR + 8u),
+			    (unsigned)(uint16_t)ldtr, (unsigned)(uint16_t)(ldtr >> 16),
+			    (unsigned)(uint32_t)(ldtr >> 32),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_LDTR + 8u),
+			    (unsigned)(uint16_t)tr, (unsigned)(uint16_t)(tr >> 16),
+			    (unsigned)(uint32_t)(tr >> 32),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_TR + 8u));
+			IOLog("AMDVM_VMEXIT_INVALID_CTRL intercepts=0x%llx cr_read_write=0x%llx dr_read_write=0x%llx exceptions=0x%llx iopm=0x%llx msrpm=0x%llx asid_tlb=0x%llx nested=0x%llx npt_root=0x%llx int_ctl_state=0x%llx\n",
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb, 0x00cu),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb, 0x000u),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb, 0x004u),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_INTERCEPT_EXCEPTIONS),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_IOPM_PA),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_MSRPM_PA),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_TLB_CONTROL),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_NESTED_PAGING),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_NPT_ROOT),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_INTERRUPT_CONTROL));
+		} else {
+			IOLog("AMDVM_NOT_RUN_FAILURE vcpu=%u vmcb_pa=0x%llx snapshot_code=0x%llx vmcb_code=0x%llx vmcb_info1=0x%llx vmcb_info2=0x%llx vmcb_next_rip=0x%llx vmcb_rip=0x%llx vmcb_clean=0x%llx eventinj=0x%llx exit_int_info=0x%llx run_status=%d owner_status=%d\n",
+			    vcpuId, (unsigned long long)context->guest_vmcb_pa,
+			    (unsigned long long)exitSnapshot.code,
+			    (unsigned long long)code,
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_EXIT_INFO1),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_EXIT_INFO2),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_NEXT_RIP),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_GUEST_RIP),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_CLEAN_BITS),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_EVENT_INJECTION),
+			    (unsigned long long)amdvm_vmcb_get_u64(context->guest_vmcb,
+			    AMDVM_VMCB_EXIT_INT_INFO), vmrunStatus, ownerStatus);
+		}
+	}
+	/*
+	 * PAUSE re-entry is compatible with native RDTSC: TSC_OFFSET and the
+	 * disabled RDTSC intercept are installed once before the first VMRUN
+	 * and remain in effect for every internal re-entry until run_done
+	 * restores them. The per-RUN request flag, not the compile-time
+	 * capability, decides whether this loop may run.
+	 */
+	if (contextRunStatus == AMDVM_HLT_CONTEXT_OK &&
+	    vmrunStatus == AMDVM_VMRUN_SUCCESS &&
+	    pauseRequested && !nmiIretStepArmed) {
+		for (;;) {
+			uint64_t eventInjection, exitIntInfo;
+			uint64_t currentKick = __sync_val_compare_and_swap(
+			    &slot.hot.kickGeneration, 0u, 0u);
+			int kickChanged = request->kick_generation != currentKick;
+			int eventPending;
+			amdvm_pause_decision_t decision;
+
+			/* Keep ordinary exits entirely on the existing QEMU dispatcher path. */
+			if (exitSnapshot.code != AMDVM_PAUSE_EXIT_CODE &&
+			    !pauseLoopStarted)
+				break;
+			if (exitSnapshot.code == AMDVM_PAUSE_EXIT_CODE &&
+			    !pauseLoopStarted) {
+				pauseLoopStarted = true;
+				clock_interval_to_deadline(150, 1000u, &pauseDeadline);
+				pauseDeadlineInitialized = true;
+				__sync_fetch_and_add(&slot.pause.fastPathEntries, 1u);
+			}
+			eventInjection = exitSnapshot.event_injection;
+			exitIntInfo = exitSnapshot.exit_int_info;
+			maskedQemuEventPossible = amdvm_pause_masked_event_possible(
+			    exitSnapshot.guest_rflags,
+			    exitSnapshot.guest_interruptibility);
+			eventPending = amdvm_pause_event_pending(eventInjection,
+			    exitIntInfo, maskedQemuEventPossible);
+			if (exitSnapshot.code != AMDVM_PAUSE_EXIT_CODE) {
+				if (kickChanged || eventPending ||
+				    amdvm_pause_exit_is_event(exitSnapshot.code)) {
+					__sync_fetch_and_add(&slot.pause.returnsEvent, 1u);
+				} else {
+					__sync_fetch_and_add(&slot.pause.returnsUnhandled, 1u);
+				}
+				break;
+			}
+			decision = amdvm_pause_decide(exitSnapshot.code,
+			    exitSnapshot.guest_rip, exitSnapshot.next_rip, pauseHandled,
+			    pauseDeadlineInitialized &&
+			    mach_absolute_time() >= pauseDeadline, kickChanged,
+			    eventPending);
+			if (decision == AMDVM_PAUSE_CONTINUE) {
+				amdvm_vmexit_snapshot_t priorPause = exitSnapshot;
+				uint64_t pauseRip = exitSnapshot.guest_rip;
+				amdvm_vmcb_set_u64(context->guest_vmcb,
+				    AMDVM_VMCB_GUEST_RIP, exitSnapshot.next_rip);
+				/* Recheck the asynchronous stop/event signal at the entry edge. */
+				currentKick = __sync_val_compare_and_swap(
+				    &slot.hot.kickGeneration, 0u, 0u);
+				eventInjection = amdvm_vmcb_get_u64(context->guest_vmcb,
+				    AMDVM_VMCB_EVENT_INJECTION);
+				exitIntInfo = amdvm_vmcb_get_u64(context->guest_vmcb,
+				    AMDVM_VMCB_EXIT_INT_INFO);
+				if (request->kick_generation != currentKick ||
+				    (eventInjection & AMDVM_PAUSE_EVENT_VALID) != 0 ||
+				    (exitIntInfo & AMDVM_PAUSE_EVENT_VALID) != 0 ||
+				    amdvm_pause_masked_event_possible(
+				        priorPause.guest_rflags,
+				        priorPause.guest_interruptibility)) {
+					amdvm_vmcb_set_u64(context->guest_vmcb,
+					    AMDVM_VMCB_GUEST_RIP, pauseRip);
+					exitSnapshot.guest_rip = pauseRip;
+					__sync_fetch_and_add(&slot.pause.returnsEvent, 1u);
+					break;
+				}
+				if (mach_absolute_time() >= pauseDeadline) {
+					amdvm_vmcb_set_u64(context->guest_vmcb,
+					    AMDVM_VMCB_GUEST_RIP, pauseRip);
+					exitSnapshot.guest_rip = pauseRip;
+					__sync_fetch_and_add(&slot.pause.returnsBudget, 1u);
+					break;
+				}
+				pauseAdvancePending = true;
+#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+				timingPhaseStarted = mach_absolute_time();
+#endif
+				contextRunStatus = amdvm_vmapi_run_context(context,
+				    &ownerStatus, &vmrunStatus, &exitSnapshot,
+				    nativeCr3);
+				if (context->host_mtrr_cache_refresh_needed) {
+					clock_interval_to_deadline(100u, kMillisecondScale,
+					    &context->host_mtrr_cache_deadline);
+					context->host_mtrr_cache_refresh_needed = 0;
+				}
+#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+				__sync_fetch_and_add(&slot.timing.vmrunTicks,
+				    mach_absolute_time() - timingPhaseStarted);
+				if (exitSnapshot.vmrun_samples != 0) {
+					__sync_fetch_and_add(&slot.timing.memoryTypeCheckTicks,
+					    exitSnapshot.memory_type_check_ticks);
+					__sync_fetch_and_add(&slot.timing.ownerAcquireTicks,
+					    exitSnapshot.owner_acquire_ticks);
+					__sync_fetch_and_add(&slot.timing.vmcbPrepareTicks,
+					    exitSnapshot.vmcb_prepare_ticks);
+					__sync_fetch_and_add(&slot.timing.vmrunXstateTicks,
+					    exitSnapshot.vmrun_xstate_ticks);
+					__sync_fetch_and_add(&slot.timing.ownerReleaseTicks,
+					    exitSnapshot.owner_release_ticks);
+					__sync_fetch_and_add(&slot.timing.vmrunSamples,
+					    exitSnapshot.vmrun_samples);
+				}
+#endif
+				if (contextRunStatus != AMDVM_HLT_CONTEXT_OK ||
+				    vmrunStatus != AMDVM_VMRUN_SUCCESS) {
+					/* A failed re-entry did not supersede the already-observed
+					 * PAUSE exit. Keep its real snapshot and original RIP. */
+					amdvm_vmcb_set_u64(context->guest_vmcb,
+					    AMDVM_VMCB_GUEST_RIP, priorPause.guest_rip);
+					exitSnapshot = priorPause;
+					__sync_fetch_and_add(&slot.pause.returnsUnhandled, 1u);
+					break;
+				}
+				if (pauseAdvancePending) {
+					pauseHandled++;
+					__sync_fetch_and_add(&slot.pause.handled, 1u);
+					pauseAdvancePending = false;
+				}
+				continue;
+			}
+			if (decision == AMDVM_PAUSE_RETURN_BUDGET) {
+				/* Leave the final PAUSE at its original RIP for QEMU's dispatcher. */
+				amdvm_vmcb_set_u64(context->guest_vmcb,
+				    AMDVM_VMCB_GUEST_RIP, exitSnapshot.guest_rip);
+				__sync_fetch_and_add(&slot.pause.returnsBudget, 1u);
+			} else if (decision == AMDVM_PAUSE_RETURN_EVENT) {
+				__sync_fetch_and_add(&slot.pause.returnsEvent, 1u);
+			} else {
+				__sync_fetch_and_add(&slot.pause.returnsUnhandled, 1u);
+			}
+			break;
+		}
+	}
+	if (nativeRdtscPrepared) {
+		amdvm_vmcb_restore_rdtsc_intercept(context->guest_vmcb, savedMisc1);
+		nativeRdtscPrepared = false;
+	}
+	if (exceptionInterceptsSaved) {
+		amdvm_vmcb_restore_exception_intercepts(context->guest_vmcb,
+		    diagnosticSavedExceptionIntercepts);
+		exceptionInterceptsSaved = false;
+	}
 	if (contextRunStatus == AMDVM_HLT_CONTEXT_RUN_GATED) {
 		/* Preserve the fail-closed result; this path did not acquire SVM. */
 		contextStatus = AMDVM_HLT_CONTEXT_RUN_GATED;
@@ -2677,6 +3702,8 @@ AMDVMProbeUserClient::vmVcpuRun(IOExternalMethodArguments *arguments)
 	result->flags |= AMDVM_VCPU_RUN_CALLED;
 	if (contextRunStatus == AMDVM_HLT_CONTEXT_OK) {
 		contextStatus = AMDVM_HLT_CONTEXT_OK;
+	} else if (contextRunStatus == AMDVM_HLT_CONTEXT_INVALID_GUEST) {
+		contextStatus = AMDVM_HLT_CONTEXT_INVALID_GUEST;
 	} else {
 		contextStatus = AMDVM_HLT_CONTEXT_VMRUN_FAILED;
 	}
@@ -2685,8 +3712,7 @@ AMDVMProbeUserClient::vmVcpuRun(IOExternalMethodArguments *arguments)
 	result->exit_info2 = exitSnapshot.info2;
 	result->next_rip = exitSnapshot.next_rip;
 	result->instruction_length = exitSnapshot.instruction_length;
-	result->exit_int_info = (uint32_t)amdvm_vmcb_get_u64(context->guest_vmcb,
-	    AMDVM_VMCB_EXIT_INT_INFO);
+	result->exit_int_info = (uint32_t)exitSnapshot.exit_int_info;
 	bcopy(exitSnapshot.instruction_bytes, result->instruction_bytes,
 	    sizeof(result->instruction_bytes));
 	if (patPrepared) {
@@ -2694,32 +3720,53 @@ AMDVMProbeUserClient::vmVcpuRun(IOExternalMethodArguments *arguments)
 		patPrepared = false;
 	}
 	if (request->kick_generation != __sync_val_compare_and_swap(
-	    &slot.kickGeneration, 0u, 0u))
+	    &slot.hot.kickGeneration, 0u, 0u))
 		result->flags |= AMDVM_VCPU_RUN_KICKED;
-	if (contextStatus == AMDVM_HLT_CONTEXT_OK &&
-	    amdvm_vm_cpu_state_get(state, context->guest_vmcb,
+	if (contextStatus == AMDVM_HLT_CONTEXT_OK) {
+#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+		timingPhaseStarted = mach_absolute_time();
+#endif
+		int stateGetStatus = amdvm_vm_cpu_state_get(state, context->guest_vmcb,
 	    reinterpret_cast<const uint64_t *>(context->guest_gprs), context->guest_xstate,
-	    &result->state) != 0)
-		contextStatus = AMDVM_HLT_CONTEXT_INVALID_GUEST;
-	else if (contextStatus == AMDVM_HLT_CONTEXT_OK && nmiIretStepArmed) {
+	    &result->state);
+#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+		__sync_fetch_and_add(&slot.timing.stateGetTicks,
+		    mach_absolute_time() - timingPhaseStarted);
+#endif
+		if (stateGetStatus != 0)
+			contextStatus = AMDVM_HLT_CONTEXT_INVALID_GUEST;
+	}
+	if (contextStatus == AMDVM_HLT_CONTEXT_OK && nmiIretStepArmed) {
 		amdvm_vmcb_finish_nmi_iret_step(context->guest_vmcb,
 		    savedExceptionIntercepts, originalGuestRflags, &result->state);
 		nmiIretStepArmed = false;
 	}
 
 run_done:
+#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+	__sync_fetch_and_add(&slot.timing.runs, 1u);
+#endif
+	context->vmcb_clean_candidates = 0;
+	if (nativeRdtscPrepared) {
+		amdvm_vmcb_restore_rdtsc_intercept(context->guest_vmcb, savedMisc1);
+	}
 	if (nmiIretStepArmed) {
 		amdvm_vmcb_finish_nmi_iret_step(context->guest_vmcb,
 		    savedExceptionIntercepts, originalGuestRflags, nullptr);
 	}
 	if (patPrepared) amdvm_hlt_context_restore_guest_pat(context);
 	if (interruptsDisabled) {
+#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+		interruptOffElapsedTicks = mach_absolute_time() - interruptOffStartTicks;
+#endif
 		(void)ml_set_interrupts_enabled(interruptState);
 		IOSimpleLockUnlock(runLock);
 	}
-	if (runLock) IOSimpleLockFree(runLock);
-	__sync_lock_test_and_set(&fVmCpus[vcpuId].runCpu, UINT32_MAX);
-	__sync_lock_test_and_set(&fVmCpus[vcpuId].runGeneration, 0u);
+#if defined(AMDVM_EXPERIMENTAL_PROVIDER_TIMING)
+	__sync_fetch_and_add(&slot.timing.interruptOffTicks, interruptOffElapsedTicks);
+#endif
+	__sync_lock_test_and_set(&fVmCpus[vcpuId].hot.runCpu, UINT32_MAX);
+	__sync_lock_test_and_set(&fVmCpus[vcpuId].hot.runGeneration, 0u);
 	result->context_status = contextStatus;
 	result->owner_status = ownerStatus;
 	result->run_status = (int32_t)vmrunStatus;
@@ -2733,17 +3780,93 @@ run_done:
 		IOLockUnlock(fVmLock);
 	}
 	outputStatus = output.copyTo(arguments);
-	if (activeReference) {
-		IOLockLock(fVmLock);
-		__sync_fetch_and_sub(&fVmCpus[vcpuId].activeRuns, 1u);
-		IOLockUnlock(fVmLock);
-	}
 	(void)firstCaptureStatus;
 	(void)secondCaptureStatus;
 	(void)cpuAfter;
 	(void)cr0Before;
 	(void)cr0After;
 	return outputStatus;
+}
+
+IOReturn
+AMDVMProbeUserClient::vmVcpuRunShared(IOExternalMethodArguments *arguments)
+{
+#if !defined(AMDVM_EXPERIMENTAL_SHARED_RUN) || \
+	!defined(AMDVM_VM_API_RUN_EXPERIMENTAL)
+	(void)arguments;
+	return kIOReturnUnsupported;
+#else
+	AMDVMObjectRetainGuard lifetime(this);
+	amdvm_vm_shared_run_call_t call = {};
+	amdvm_vm_shared_run_ack_t ack = {};
+	amdvm_vm_shared_run_slot_t *sharedSlot;
+	IOBufferMemoryDescriptor *sharedMemory = nullptr;
+	IOExternalMethodArguments runArguments = {};
+	IOReturn runStatus = kIOReturnBadArgument;
+
+	if (arguments == nullptr || arguments->structureInputDescriptor != nullptr ||
+	    arguments->structureInput == nullptr ||
+	    arguments->structureInputSize != sizeof(call) ||
+	    arguments->structureOutputDescriptor != nullptr ||
+	    arguments->structureOutput == nullptr ||
+	    arguments->structureOutputSize < sizeof(ack)) {
+		return kIOReturnBadArgument;
+	}
+	bcopy(arguments->structureInput, &call, sizeof(call));
+	ack.abi_version = AMDVM_VM_ABI_DRAFT_VERSION;
+	ack.structure_size = sizeof(ack);
+	ack.vcpu_id = call.vcpu_id;
+	ack.sequence = call.sequence;
+	ack.map_generation = call.map_generation;
+	if (call.abi_version != AMDVM_VM_ABI_DRAFT_VERSION ||
+	    call.structure_size != sizeof(call) ||
+	    call.vcpu_id >= AMDVM_VM_ABI_DRAFT_MAX_VCPUS ||
+	    call.sequence == 0 ||
+	    !amdvm_vm_shared_run_request_size_valid(call.request_size) ||
+	    amdvm_client_mode_accepts(&fApiMode,
+	    AMDVM_CLIENT_MODE_VM_SCOPED) != AMDVM_CLIENT_MODE_OK) {
+		goto shared_run_done;
+	}
+	IOLockLock(fVmLock);
+	if (fVmClosed || fVmRunSharedArea == nullptr ||
+	    fVmRunSharedMemory == nullptr || call.map_generation != fVmGeneration) {
+		IOLockUnlock(fVmLock);
+		runStatus = kIOReturnNotReady;
+		goto shared_run_done;
+	}
+	sharedSlot = &fVmRunSharedArea->slots[call.vcpu_id];
+	if (!amdvm_vm_shared_run_provider_claim(sharedSlot, call.sequence,
+	    call.request_size)) {
+		IOLockUnlock(fVmLock);
+		runStatus = kIOReturnNotReady;
+		goto shared_run_done;
+	}
+	/* Pin the shared request/result memory across the internal RUN and response
+	 * publication. VM destroy may drop its own reference after releasing the
+	 * lock, but cannot invalidate this claimed slot until we complete it. */
+	sharedMemory = fVmRunSharedMemory;
+	sharedMemory->retain();
+	IOLockUnlock(fVmLock);
+
+	bzero(sharedSlot->result, sizeof(sharedSlot->result));
+	runArguments.structureInput = sharedSlot->request;
+	runArguments.structureInputSize = call.request_size;
+	runArguments.structureOutput = sharedSlot->result;
+	runArguments.structureOutputSize = sizeof(sharedSlot->result);
+	runStatus = vmVcpuRunInternal(&runArguments, (int32_t)call.vcpu_id, true);
+	/* Publish the response before COMPLETE makes the slot visible to QEMU. */
+	if (!amdvm_vm_shared_run_provider_complete(sharedSlot, call.sequence,
+	    (int32_t)runStatus)) {
+		runStatus = kIOReturnError;
+	}
+	sharedMemory->release();
+
+shared_run_done:
+	ack.status = runStatus;
+	bcopy(&ack, arguments->structureOutput, sizeof(ack));
+	arguments->structureOutputSize = sizeof(ack);
+	return kIOReturnSuccess;
+#endif
 }
 
 IOReturn
@@ -2790,7 +3913,8 @@ AMDVMProbeUserClient::vmSetMemoryMap(IOExternalMethodArguments *arguments)
 	if (replacing) {
 		for (size_t i = 0; i < AMDVM_VM_ABI_DRAFT_MAX_VCPUS; ++i) {
 			if (fVmCpus[i].context ||
-			    __sync_val_compare_and_swap(&fVmCpus[i].activeRuns, 0u, 0u) != 0) {
+			    amdvm_run_slot_refcount(&fVmCpus[i].hot.runState) != 0 ||
+			    amdvm_run_slot_is_closing(&fVmCpus[i].hot.runState)) {
 				IOLockUnlock(fVmLock); return kIOReturnBusy;
 			}
 		}
@@ -2804,7 +3928,9 @@ AMDVMProbeUserClient::vmSetMemoryMap(IOExternalMethodArguments *arguments)
 		result.context_status = amdvm_vm_memory_commit(candidate, fVmGeneration + 1u);
 		if (result.context_status == AMDVM_VM_MEMORY_OK) {
 			if (replacing) {
-				int closeStatus = amdvm_vm_memory_close(&fVmMemory, 0);
+				int sharedStatus = destroyVmSharedContextLocked();
+				int closeStatus = sharedStatus == AMDVM_HLT_CONTEXT_OK ?
+				    amdvm_vm_memory_close(&fVmMemory, 0) : sharedStatus;
 				if (closeStatus != AMDVM_VM_MEMORY_OK) {
 					/* Fail closed if old pins cannot be retired after vCPU teardown. */
 					fVmPending = candidate;
@@ -2866,6 +3992,7 @@ AMDVMProbeUserClient::vmDestroy(IOExternalMethodArguments *arguments)
 	result.abi_version = AMDVM_VM_ABI_DRAFT_VERSION;
 	result.structure_size = sizeof(result);
 	int cpus = closeVmCpusLocked();
+	if (!cpus) cpus = destroyVmSharedContextLocked();
 	if (cpus) {
 		/* Keep shared RAM/NPT backing pinned until active RUN calls drain. */
 		result.context_status = cpus;
@@ -2928,6 +4055,27 @@ AMDVMProbeUserClient::vmApiNegotiate(IOExternalMethodArguments *arguments)
 	if (status != AMDVM_VM_NEGOTIATE_OK) {
 		return kIOReturnBadArgument;
 	}
+	#if defined(AMDVM_EXPERIMENTAL_SHARED_RUN)
+	IOLockLock(fVmLock);
+	if (fVmRunSharedMemory == nullptr) {
+		auto *descriptor = IOBufferMemoryDescriptor::inTaskWithOptions(
+		    kernel_task, kIOMemoryKernelUserShared | kIODirectionInOut,
+		    sizeof(amdvm_vm_shared_run_area_t), 64);
+		if (descriptor != nullptr &&
+		    descriptor->getLength() >= sizeof(amdvm_vm_shared_run_area_t) &&
+		    descriptor->getBytesNoCopy() != nullptr) {
+			fVmRunSharedMemory = descriptor;
+			fVmRunSharedArea = static_cast<amdvm_vm_shared_run_area_t *>(
+			    descriptor->getBytesNoCopy());
+			bzero(fVmRunSharedArea, sizeof(*fVmRunSharedArea));
+		} else if (descriptor != nullptr) {
+			descriptor->release();
+		}
+	}
+	bool sharedRunReady = fVmRunSharedMemory != nullptr &&
+	    fVmRunSharedArea != nullptr;
+	IOLockUnlock(fVmLock);
+	#endif
 	result.max_memory_ranges = AMDVM_VCPU_MEMORY_MAX_RANGES;
 	result.max_guest_bytes = limits.max_guest_bytes;
 	result.max_mapped_bytes = limits.max_mapped_bytes;
@@ -2936,14 +4084,55 @@ AMDVMProbeUserClient::vmApiNegotiate(IOExternalMethodArguments *arguments)
 	    AMDVM_VM_ABI_DRAFT_FEATURE_MAP_REPLACE_V1 |
 	    AMDVM_VM_ABI_DRAFT_FEATURE_PER_VCPU_NPT | AMDVM_VM_ABI_DRAFT_FEATURE_VCPU_PREPARE |
 	    AMDVM_VM_ABI_DRAFT_FEATURE_VCPU_STATE_V1 |
-	    AMDVM_VM_ABI_DRAFT_FEATURE_VCPU_MEMORY_TYPES;
+	    AMDVM_VM_ABI_DRAFT_FEATURE_VCPU_MEMORY_TYPES |
+	    AMDVM_VM_ABI_DRAFT_FEATURE_NATIVE_CR8_V1;
 /* RUN/KICK are exposed only in the explicit experimental VM API build. */
 #if defined(AMDVM_VM_API_RUN_EXPERIMENTAL)
 	result.feature_flags |= AMDVM_VM_ABI_DRAFT_FEATURE_VCPU_RUN_V1 |
 	    AMDVM_VM_ABI_DRAFT_FEATURE_VCPU_KICK_V1;
+	result.feature_flags |= AMDVM_VM_ABI_DRAFT_FEATURE_ATOMIC_RUN_SLOT_V1;
+	result.feature_flags |= AMDVM_VM_ABI_DRAFT_FEATURE_DIAGNOSTIC_GP_INTERCEPT;
+	result.feature_flags |= AMDVM_VM_ABI_DRAFT_FEATURE_DIAGNOSTIC_PF_INTERCEPT;
+	/* NMI injection and the IRET-step unblock protocol are implemented as part
+	 * of RUN semantics; advertising RUN without this capability is an ABI lie. */
+	result.feature_flags |= AMDVM_VM_ABI_DRAFT_FEATURE_NMI_EVENT_V1;
+	result.feature_flags |= AMDVM_VM_ABI_DRAFT_FEATURE_MTRR_PAT_CACHE_V1;
+#if defined(AMDVM_EXPERIMENTAL_NATIVE_CR3)
+	result.feature_flags |= AMDVM_VM_ABI_DRAFT_FEATURE_NATIVE_CR3_V1;
+#endif
+#if defined(AMDVM_EXPERIMENTAL_NATIVE_RDTSC)
+	result.feature_flags |= AMDVM_VM_ABI_DRAFT_FEATURE_NATIVE_RDTSC_V1;
+#endif
+#if defined(AMDVM_EXPERIMENTAL_PROVIDER_PAUSE)
+	result.feature_flags |=
+	    AMDVM_VM_ABI_DRAFT_FEATURE_PROVIDER_PAUSE_STATS_V1;
+#endif
+#if defined(AMDVM_EXPERIMENTAL_SHARED_RUN)
+	if (sharedRunReady) {
+		result.feature_flags |=
+		    AMDVM_VM_ABI_DRAFT_FEATURE_SHARED_VCPU_RUN_V1;
+	}
+#endif
 #endif
 	bcopy(&result, output.bytes(), sizeof(result));
 	return output.copyTo(arguments);
+}
+
+IOReturn
+AMDVMProbeUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
+	IOMemoryDescriptor **memory)
+{
+	if (type != AMDVM_VM_ABI_DRAFT_SHARED_RUN_MEMORY_TYPE ||
+	    options == nullptr || memory == nullptr ||
+	    fVmRunSharedMemory == nullptr || fVmRunSharedArea == nullptr ||
+	    amdvm_client_mode_accepts(&fApiMode,
+	    AMDVM_CLIENT_MODE_VM_SCOPED) != AMDVM_CLIENT_MODE_OK) {
+		return kIOReturnUnsupported;
+	}
+	fVmRunSharedMemory->retain();
+	*memory = fVmRunSharedMemory;
+	*options = kIOMapAnywhere;
+	return kIOReturnSuccess;
 }
 
 IOReturn
@@ -3001,6 +4190,8 @@ AMDVMProbeUserClient::externalMethod(uint32_t selector,
 		return vmVcpuState(arguments, selector == AMDVM_VM_ABI_DRAFT_SELECTOR_VCPU_SET_STATE);
 	if (selector == AMDVM_VM_ABI_DRAFT_SELECTOR_VCPU_SET_MEMORY_TYPES)
 		return vmVcpuSetMemoryTypes(arguments);
+	if (selector == AMDVM_VM_ABI_DRAFT_SELECTOR_VCPU_RUN_SHARED)
+		return vmVcpuRunShared(arguments);
 	if (selector == AMDVM_VM_ABI_DRAFT_SELECTOR_VCPU_KICK ||
 	    selector == AMDVM_VM_ABI_DRAFT_SELECTOR_VCPU_RUN) {
 	#if defined(AMDVM_VM_API_RUN_EXPERIMENTAL)
@@ -3142,6 +4333,11 @@ AMDVMProbeUserClient::free(void)
 			}
 			__sync_lock_release(&fVcpuBusy);
 		}
+	}
+	if (fVmRunSharedMemory != nullptr) {
+		fVmRunSharedMemory->release();
+		fVmRunSharedMemory = nullptr;
+		fVmRunSharedArea = nullptr;
 	}
 	if (fVmLock != nullptr) { IOLockFree(fVmLock); fVmLock = nullptr; }
 	super::free();

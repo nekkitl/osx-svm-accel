@@ -34,6 +34,7 @@ AMDVMFirmwareDispatchAction amdsvm_dispatch_firmware_exit(
     amdvm_x86_guest_state_v1_t state;
     AMDVMFirmwareDispatchAction action;
     int event_status;
+    bool store_before_handler;
 
     if (!request || !result || !ops ||
         result->abi_version != AMDVM_VCPU_ABI_VERSION ||
@@ -57,21 +58,58 @@ AMDVMFirmwareDispatchAction amdsvm_dispatch_firmware_exit(
             AMDVM_FIRMWARE_DISPATCH_ERROR;
     }
 
+    /* SVM_EXIT_ERR is a completed hardware exit, not a transport failure. */
+    if (result->exit_code == SVM_EXIT_ERR) {
+        return AMDVM_FIRMWARE_DISPATCH_RESET;
+    }
+    if (result->exit_code == SVM_EXIT_NOT_RUN ||
+        result->exit_code == SVM_EXIT_INVALID) {
+        return AMDVM_FIRMWARE_DISPATCH_ERROR;
+    }
+
     state = result->state;
     if (!ops->complete_event) {
         return AMDVM_FIRMWARE_DISPATCH_ERROR;
     }
     event_status = ops->complete_event(opaque, result->exit_code,
                                        result->exit_int_info, &state);
-    if (event_status < 0 ||
-        amdsvm_dispatch_store_state(ops, opaque, &state) !=
-            AMDVM_FIRMWARE_DISPATCH_CONTINUE) {
+    if (event_status < 0) {
         return AMDVM_FIRMWARE_DISPATCH_ERROR;
     }
     if (event_status > 0) {
+        if (amdsvm_dispatch_store_state(ops, opaque, &state) !=
+            AMDVM_FIRMWARE_DISPATCH_CONTINUE) {
+            return AMDVM_FIRMWARE_DISPATCH_ERROR;
+        }
         return result->exit_code == AMDVM_VCPU_EXPECTED_DB_EXIT ?
                AMDVM_FIRMWARE_DISPATCH_CONTINUE :
                AMDVM_FIRMWARE_DISPATCH_ERROR;
+    }
+
+    /* Pure instruction emulation consumes the returned snapshot and commits
+     * once after the emulated result is complete. Control/device handlers use
+     * CPUX86State directly, so they first need the hardware-exit state loaded. */
+    store_before_handler = result->exit_code == SVM_EXIT_WRITE_CR0 ||
+        result->exit_code == SVM_EXIT_WRITE_CR2 ||
+        result->exit_code == SVM_EXIT_WRITE_CR3 ||
+        result->exit_code == SVM_EXIT_WRITE_CR4 ||
+        result->exit_code == SVM_EXIT_WRITE_CR8 ||
+        result->exit_code == SVM_EXIT_READ_CR0 ||
+        result->exit_code == SVM_EXIT_READ_CR2 ||
+        result->exit_code == SVM_EXIT_READ_CR3 ||
+        result->exit_code == SVM_EXIT_READ_CR4 ||
+        result->exit_code == SVM_EXIT_READ_CR8 ||
+        (result->exit_code >= SVM_EXIT_READ_DR0 &&
+         result->exit_code <= SVM_EXIT_WRITE_DR0 + 7u) ||
+        result->exit_code == AMDVM_VCPU_EXIT_MSR ||
+        result->exit_code == SVM_EXIT_NPF ||
+        result->exit_code == SVM_EXIT_XSETBV ||
+        result->exit_code == SVM_EXIT_IRET ||
+        result->exit_code == AMDVM_VCPU_EXIT_PHYSICAL_INTR;
+    if (store_before_handler &&
+        amdsvm_dispatch_store_state(ops, opaque, &state) !=
+            AMDVM_FIRMWARE_DISPATCH_CONTINUE) {
+        return AMDVM_FIRMWARE_DISPATCH_ERROR;
     }
 
     if (result->exit_code == AMDVM_VCPU_EXPECTED_CPUID_EXIT) {
@@ -109,6 +147,55 @@ AMDVMFirmwareDispatchAction amdsvm_dispatch_firmware_exit(
         return amdsvm_dispatch_store_state(ops, opaque, &state);
     }
 
+    if (result->exit_code == SVM_EXIT_RDTSCP) {
+        uint64_t tsc;
+        uint32_t aux;
+
+        /* RDTSCP is the unprefixed three-byte instruction 0F 01 F9. */
+        if (result->exit_info1 != 0 || result->exit_info2 != 0 ||
+            result->next_rip != state.rip + 3u ||
+            ((state.cr[4] & AMDVM_CR4_TSD) &&
+             (state.segments[AMDVM_X86_SEG_CS].selector & 3u)) ||
+            !ops->emulate_rdtscp ||
+            ops->emulate_rdtscp(opaque, &tsc, &aux) != 0) {
+            return AMDVM_FIRMWARE_DISPATCH_ERROR;
+        }
+        state.gpr[AMDSVM_GPR_RAX] = (uint32_t)tsc;
+        state.gpr[AMDSVM_GPR_RDX] = (uint32_t)(tsc >> 32);
+        state.gpr[AMDSVM_GPR_RCX] = aux;
+        state.rip = result->next_rip;
+        return amdsvm_dispatch_store_state(ops, opaque, &state);
+    }
+
+    if (result->exit_code == SVM_EXIT_MONITOR) {
+        /* MONITOR is only a wait hint in this firmware path.  The provider
+         * intercepts it, so resume after the instruction when its privilege
+         * and ECX constraints are valid; the guest can continue polling. */
+        if (result->exit_info1 != 0 || result->exit_info2 != 0 ||
+            result->next_rip != state.rip + 3u ||
+            (uint32_t)state.gpr[AMDSVM_GPR_RCX] != 0 ||
+            (state.segments[AMDVM_X86_SEG_CS].selector & 3u) != 0) {
+            return AMDVM_FIRMWARE_DISPATCH_ERROR;
+        }
+        state.rip = result->next_rip;
+        return amdsvm_dispatch_store_state(ops, opaque, &state);
+    }
+
+    if (result->exit_code == SVM_EXIT_MWAIT) {
+        /* Match QEMU's SMP MWAIT helper: complete the hint and yield so
+         * another vCPU or a pending event can make progress. */
+        if (result->exit_info1 != 0 || result->exit_info2 != 0 ||
+            result->next_rip != state.rip + 3u ||
+            (uint32_t)state.gpr[AMDSVM_GPR_RCX] != 0 ||
+            (state.segments[AMDVM_X86_SEG_CS].selector & 3u) != 0) {
+            return AMDVM_FIRMWARE_DISPATCH_ERROR;
+        }
+        state.rip = result->next_rip;
+        action = amdsvm_dispatch_store_state(ops, opaque, &state);
+        return action == AMDVM_FIRMWARE_DISPATCH_CONTINUE ?
+               AMDVM_FIRMWARE_DISPATCH_YIELDED : action;
+    }
+
     if (result->exit_code == AMDVM_VCPU_EXPECTED_IOIO_EXIT) {
         uint64_t info = result->exit_info1;
         uint64_t size_bits = (info >> 4) & 7u;
@@ -129,13 +216,20 @@ AMDVMFirmwareDispatchAction amdsvm_dispatch_firmware_exit(
         if (is_string) {
             amdvm_x86_guest_state_v1_t updated_state = state;
 
+            /* String I/O decodes and executes against CPUX86State, so it
+             * must see the hardware-exit snapshot before decoding. The
+             * handler commits its emulated result in CPUX86State itself. */
+            if (amdsvm_dispatch_store_state(ops, opaque, &state) !=
+                AMDVM_FIRMWARE_DISPATCH_CONTINUE) {
+                return AMDVM_FIRMWARE_DISPATCH_ERROR;
+            }
             if (!ops->emulate_string_io ||
                 ops->emulate_string_io(opaque, &state, info,
                                        result->next_rip,
                                        &updated_state) != 0) {
                 return AMDVM_FIRMWARE_DISPATCH_ERROR;
             }
-            return amdsvm_dispatch_store_state(ops, opaque, &updated_state);
+            return AMDVM_FIRMWARE_DISPATCH_CONTINUE;
         }
         if (has_rep) {
             return AMDVM_FIRMWARE_DISPATCH_ERROR;
@@ -166,10 +260,12 @@ AMDVMFirmwareDispatchAction amdsvm_dispatch_firmware_exit(
         result->exit_code == SVM_EXIT_READ_CR2 ||
         result->exit_code == SVM_EXIT_READ_CR3 ||
         result->exit_code == SVM_EXIT_READ_CR4 ||
+        result->exit_code == SVM_EXIT_READ_CR8 ||
         result->exit_code == SVM_EXIT_WRITE_CR0 ||
         result->exit_code == SVM_EXIT_WRITE_CR2 ||
         result->exit_code == SVM_EXIT_WRITE_CR3 ||
-        result->exit_code == SVM_EXIT_WRITE_CR4) {
+        result->exit_code == SVM_EXIT_WRITE_CR4 ||
+        result->exit_code == SVM_EXIT_WRITE_CR8) {
         return ops->handle_cr ? ops->handle_cr(opaque, result) :
                AMDVM_FIRMWARE_DISPATCH_ERROR;
     }

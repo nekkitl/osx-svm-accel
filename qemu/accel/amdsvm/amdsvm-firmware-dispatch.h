@@ -12,6 +12,7 @@ typedef enum AMDVMFirmwareDispatchAction {
     AMDVM_FIRMWARE_DISPATCH_CONTINUE = 0,
     AMDVM_FIRMWARE_DISPATCH_HALTED = 1,
     AMDVM_FIRMWARE_DISPATCH_YIELDED = 2,
+    AMDVM_FIRMWARE_DISPATCH_RESET = 3,
 } AMDVMFirmwareDispatchAction;
 
 typedef struct AMDVMFirmwareDispatchOps {
@@ -26,8 +27,10 @@ typedef struct AMDVMFirmwareDispatchOps {
                          uint32_t *eax, uint32_t *ebx,
                          uint32_t *ecx, uint32_t *edx);
     int (*emulate_rdtsc)(void *opaque, uint64_t *value);
+    int (*emulate_rdtscp)(void *opaque, uint64_t *value, uint32_t *aux);
     int (*emulate_io)(void *opaque, uint32_t port, bool is_input,
                       unsigned size, uint64_t *rax);
+    /* Executes against the already stored CPU state and commits its result. */
     int (*emulate_string_io)(
         void *opaque, const amdvm_x86_guest_state_v1_t *state,
         uint64_t exit_info1, uint64_t next_rip,

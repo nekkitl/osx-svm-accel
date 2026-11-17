@@ -10,6 +10,9 @@
 #include "amdvm_quarantine.h"
 #include "amdvm_svm_owner.h"
 #include "amdvm_vmrun.h"
+#include "amdvm_vmcb_clean_policy.h"
+#include "amdvm_tlb_policy.h"
+#include "amdvm_asid_caps_cache.h"
 #include "../amdvm_probe_abi.h"
 
 #define AMDVM_HLT_CONTEXT_QUARANTINE_SLOTS AMDVM_QUARANTINE_MAX_SLOTS
@@ -48,6 +51,12 @@ typedef struct amdvm_hlt_context {
 	uint64_t guest_payload_pa;
 	uint64_t guest_payload_gpa;
 	uint64_t hsave_pa;
+	uint32_t tlb_asid;
+	uint32_t tlb_asid_allocated;
+	amdvm_asid_caps_cache_t asid_caps_cache;
+	amdvm_tlb_policy_t tlb_policy;
+	amdvm_vmcb_clean_policy_t vmcb_clean_policy;
+	uint32_t vmcb_clean_candidates;
 	uint64_t guest_page_count;
 	size_t guest_range_count;
 	size_t guest_payload_offset;
@@ -59,9 +68,18 @@ typedef struct amdvm_hlt_context {
 	uint64_t architectural_guest_pat;
 	uint32_t execution_pat_active;
 	amdvm_host_mtrr_state_t host_mtrr;
+	uint32_t npt_shared;
 	uint32_t guest_memory_mapped;
 	uint32_t host_pat_valid;
 	uint32_t host_mtrr_valid;
+	uint32_t host_mtrr_cache_enabled;
+	uint32_t host_mtrr_cache_valid;
+	uint32_t host_mtrr_cache_cpu;
+	uint32_t host_mtrr_cache_runs;
+	uint32_t host_mtrr_cache_refresh_needed;
+	uint64_t host_mtrr_cache_pat;
+	uint64_t host_mtrr_cache_default_type;
+	uint64_t host_mtrr_cache_deadline;
 	uint32_t failed;
 	uint32_t quarantine_slot;
 	uint64_t quarantine_generation;
@@ -109,6 +127,10 @@ int amdvm_hlt_context_map_user_ranges(amdvm_hlt_context_t *context,
  * Builds a private NPT and retains a borrow; never pins RAM a second time. */
 int amdvm_hlt_context_attach_vm_memory(amdvm_hlt_context_t *context,
 	struct amdvm_vm_memory *memory, uint64_t generation, size_t *npt_pages);
+int amdvm_hlt_context_attach_shared_npt(amdvm_hlt_context_t *context,
+	struct amdvm_vm_memory *memory, uint64_t generation,
+	const amdvm_npt_t *npt, size_t npt_pages,
+	const amdvm_host_mtrr_state_t *host_mtrr);
 int amdvm_hlt_context_set_memory_types(amdvm_hlt_context_t *context,
 	const amdvm_vcpu_set_memory_types_request_t *request,
 	size_t *updated_page_count);
